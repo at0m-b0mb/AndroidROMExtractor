@@ -26,6 +26,7 @@ class Settings:
     recent_backups: list[str] = field(default_factory=list)
     partition_presets: dict[str, list[str]] = field(default_factory=dict)
     window_geometry: str = ""
+    theme: str = "dark"   # 'dark' | 'light' | 'system'
 
     @classmethod
     def load(cls) -> "Settings":

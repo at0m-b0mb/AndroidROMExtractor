@@ -26,11 +26,19 @@ def _pick_device(serial: Optional[str]) -> device_mod.Device:
 
 
 class _NiceErrorGroup(click.Group):
-    """Top-level group that prints RuntimeError / FileNotFoundError as one-liners."""
+    """Top-level group that prints RuntimeError / FileNotFoundError as one-liners.
+
+    Click's own control-flow exceptions (UsageError, Exit from --help, Abort)
+    must be re-raised so the framework handles them normally.
+    """
 
     def invoke(self, ctx: click.Context):
         try:
             return super().invoke(ctx)
+        except (click.exceptions.ClickException,
+                click.exceptions.Exit,
+                click.exceptions.Abort):
+            raise
         except (RuntimeError, FileNotFoundError) as e:
             console.print(f"[red]Error:[/red] {e}")
             sys.exit(1)

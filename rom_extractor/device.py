@@ -41,6 +41,82 @@ class Device:
         )
 
 
+@dataclass
+class DeviceHealth:
+    """Optional ambient device info: battery level, /data free, etc."""
+    battery_level: Optional[int] = None     # 0-100
+    battery_status: Optional[str] = None    # 'Charging', 'Discharging', 'Full', ...
+    battery_temp_c: Optional[float] = None
+    data_total_bytes: Optional[int] = None
+    data_free_bytes: Optional[int] = None
+
+
+def _parse_dumpsys_battery(blob: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in blob.splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _parse_df_one_line(blob: str) -> tuple[Optional[int], Optional[int]]:
+    """Parse `df -k -P /data` output. Returns (total_bytes, free_bytes)."""
+    lines = [l for l in blob.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return None, None
+    parts = lines[-1].split()
+    # POSIX format: Filesystem 1024-blocks Used Available Capacity Mounted on
+    if len(parts) < 5:
+        return None, None
+    try:
+        total_kb = int(parts[1])
+        free_kb = int(parts[3])
+        return total_kb * 1024, free_kb * 1024
+    except (ValueError, IndexError):
+        return None, None
+
+
+def query_health(serial: Optional[str] = None) -> DeviceHealth:
+    """Best-effort fetch of battery + /data storage. Never raises."""
+    health = DeviceHealth()
+    try:
+        blob = adb.shell("dumpsys battery", serial=serial, check=False,
+                         timeout=5)
+        b = _parse_dumpsys_battery(blob)
+        if "level" in b:
+            try:
+                health.battery_level = int(b["level"])
+            except ValueError:
+                pass
+        if "status" in b:
+            health.battery_status = {
+                "1": "Unknown", "2": "Charging", "3": "Discharging",
+                "4": "Not charging", "5": "Full",
+            }.get(b["status"], b["status"])
+        if "temperature" in b:
+            try:
+                # value is in 0.1 °C
+                health.battery_temp_c = int(b["temperature"]) / 10.0
+            except ValueError:
+                pass
+    except Exception as e:
+        log.debug("battery query failed: %s", e)
+
+    try:
+        blob = adb.shell("df -k -P /data", serial=serial, check=False,
+                         timeout=5)
+        total, free = _parse_df_one_line(blob)
+        health.data_total_bytes = total
+        health.data_free_bytes = free
+    except Exception as e:
+        log.debug("storage query failed: %s", e)
+
+    return health
+
+
 def _parse_getprop(blob: str) -> dict[str, str]:
     props: dict[str, str] = {}
     for line in blob.splitlines():
