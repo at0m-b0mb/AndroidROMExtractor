@@ -5,6 +5,7 @@ import hashlib
 import logging
 import shlex
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -29,16 +30,22 @@ from .utils import CommandError, console, human_size
 #   {"type": "error",   "name": str, "error": str}
 EventCallback = Callable[[dict], None]
 
+
+class BackupCancelled(RuntimeError):
+    """Raised when a caller-supplied cancel event is set mid-backup."""
+
 log = logging.getLogger(__name__)
 
 CHUNK = 1 << 20  # 1 MiB read chunks from adb stdout pipe
 
 
 def _stream_dd(serial: Optional[str], partition: Partition, out_file: Path,
-               on_chunk: Callable[[int], None]) -> tuple[int, str]:
+               on_chunk: Callable[[int], None],
+               cancel: Optional[threading.Event] = None) -> tuple[int, str]:
     """
     Pipe `su -c dd if=<block> bs=1M` over `adb exec-out`, write to out_file, hash as we go.
     Calls on_chunk(n_bytes) after each chunk so the caller can drive its own progress UI.
+    If `cancel` is set mid-stream, kills the subprocess and raises BackupCancelled.
     Returns (bytes_written, sha256_hex).
     """
     # `adb exec-out` is critical here — it bypasses the PTY line-mode mangling
@@ -58,9 +65,13 @@ def _stream_dd(serial: Optional[str], partition: Partition, out_file: Path,
 
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout is not None
+    cancelled = False
     try:
         with out_file.open("wb") as f:
             while True:
+                if cancel is not None and cancel.is_set():
+                    cancelled = True
+                    break
                 buf = proc.stdout.read(CHUNK)
                 if not buf:
                     break
@@ -68,6 +79,9 @@ def _stream_dd(serial: Optional[str], partition: Partition, out_file: Path,
                 h.update(buf)
                 written += len(buf)
                 on_chunk(len(buf))
+        if cancelled:
+            proc.kill()
+            raise BackupCancelled(f"cancelled while backing up {partition.name}")
         ret = proc.wait()
     finally:
         if proc.poll() is None:
@@ -101,6 +115,7 @@ def backup_partitions(
     verify_on_device: bool = True,
     dry_run: bool = False,
     events: Optional[EventCallback] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> list[dict]:
     """
     Back up partitions to out_dir.
@@ -125,12 +140,14 @@ def backup_partitions(
         return entries
 
     if events is not None:
-        return _backup_with_callback(device, parts, out_dir, verify_on_device, events)
+        return _backup_with_callback(device, parts, out_dir, verify_on_device,
+                                     events, cancel)
 
-    return _backup_with_rich(device, parts, out_dir, verify_on_device)
+    return _backup_with_rich(device, parts, out_dir, verify_on_device, cancel)
 
 
-def _backup_with_rich(device, parts, out_dir, verify_on_device) -> list[dict]:
+def _backup_with_rich(device, parts, out_dir, verify_on_device,
+                      cancel: Optional[threading.Event] = None) -> list[dict]:
     entries: list[dict] = []
     with Progress(
         TextColumn("[bold blue]{task.description}"),
@@ -141,6 +158,8 @@ def _backup_with_rich(device, parts, out_dir, verify_on_device) -> list[dict]:
         console=console,
     ) as progress:
         for p in parts:
+            if cancel is not None and cancel.is_set():
+                break
             target = out_dir / p.filename()
             total = p.size_bytes if p.size_bytes else 0
             task = progress.add_task(p.name, total=total or None)
@@ -150,7 +169,11 @@ def _backup_with_rich(device, parts, out_dir, verify_on_device) -> list[dict]:
                 written, host_sha = _stream_dd(
                     device.serial, p, target,
                     on_chunk=lambda n: progress.update(task, advance=n),
+                    cancel=cancel,
                 )
+            except BackupCancelled:
+                progress.update(task, description=f"[yellow]{p.name} cancelled")
+                break
             except CommandError as e:
                 progress.update(task, description=f"[red]{p.name} FAILED")
                 log.error("backup of %s failed: %s", p.name, e)
@@ -186,9 +209,13 @@ def _backup_with_rich(device, parts, out_dir, verify_on_device) -> list[dict]:
 
 
 def _backup_with_callback(device, parts, out_dir, verify_on_device,
-                          events: EventCallback) -> list[dict]:
+                          events: EventCallback,
+                          cancel: Optional[threading.Event] = None) -> list[dict]:
     entries: list[dict] = []
     for p in parts:
+        if cancel is not None and cancel.is_set():
+            events({"type": "cancelled", "name": p.name})
+            break
         target = out_dir / p.filename()
         events({"type": "start", "name": p.name, "total": p.size_bytes})
         started = datetime.now(timezone.utc)
@@ -197,7 +224,11 @@ def _backup_with_callback(device, parts, out_dir, verify_on_device,
                 device.serial, p, target,
                 on_chunk=lambda n, _name=p.name: events(
                     {"type": "advance", "name": _name, "bytes": n}),
+                cancel=cancel,
             )
+        except BackupCancelled:
+            events({"type": "cancelled", "name": p.name})
+            break
         except CommandError as e:
             events({"type": "error", "name": p.name, "error": str(e)})
             continue

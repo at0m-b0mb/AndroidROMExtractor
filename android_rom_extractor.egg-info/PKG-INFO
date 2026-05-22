@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: android-rom-extractor
+Version: 0.1.0
+Summary: Extract and flash full ROM backups from Android devices.
+Author: at0m
+Requires-Python: >=3.9
+Requires-Dist: rich>=13.0
+Requires-Dist: click>=8.1
+Requires-Dist: customtkinter>=5.2
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

@@ -5,11 +5,17 @@ states, toast notifications, confirm dialogs, and live per-operation progress.
 """
 from __future__ import annotations
 
+import json
 import logging
+import platform
 import queue
+import shutil
+import subprocess
 import threading
+import time
 import tkinter as tk
 import traceback
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog
 from typing import Callable, Optional
@@ -19,11 +25,17 @@ import customtkinter as ctk
 from . import __version__, adb as adb_mod, backup as backup_mod
 from . import device as device_mod, flash as flash_mod
 from . import partitions as part_mod
+from . import settings as settings_mod
+from . import verify as verify_mod
 from .device import Device
 from .manifest import Manifest, MANIFEST_FILENAME
 from .partitions import (DEFAULT_BACKUP_SET, MTK_CRITICAL, Partition,
                          is_dangerous)
 from .utils import human_size, sha256_file
+
+IS_MAC = platform.system() == "Darwin"
+MOD_KEY = "Command" if IS_MAC else "Control"
+MOD_LABEL = "⌘" if IS_MAC else "Ctrl"
 
 log = logging.getLogger(__name__)
 
@@ -367,6 +379,28 @@ class ConfirmDialog(ctk.CTkToplevel):
         )
         self._confirm_btn.pack(side="right")
 
+        # Keyboard: Return submits when enabled; Escape cancels; window X = cancel.
+        self.bind("<Return>", self._maybe_confirm)
+        self.bind("<KP_Enter>", self._maybe_confirm)
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        # Focus appropriately.
+        self.after(50, self._focus_default)
+
+    def _focus_default(self) -> None:
+        try:
+            if self._require_typed:
+                self._entry.focus_set()
+            else:
+                self._confirm_btn.focus_set()
+        except Exception:
+            pass
+
+    def _maybe_confirm(self, _e=None):
+        if str(self._confirm_btn.cget("state")) == "normal":
+            self._confirm()
+
     def _on_type(self, _e):
         ok = self._entry.get().strip() == self._require_typed
         self._confirm_btn.configure(state="normal" if ok else "disabled")
@@ -387,17 +421,74 @@ class ConfirmDialog(ctk.CTkToplevel):
         return dlg._result
 
 
+class AboutDialog(ctk.CTkToplevel):
+    """A small modal with project info, version, and a link."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("")
+        self.geometry("440x340")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.transient(master)
+        self.grab_set()
+
+        wrap = ctk.CTkFrame(
+            self, fg_color=SURFACE, corner_radius=12,
+            border_width=1, border_color=BORDER,
+        )
+        wrap.pack(expand=True, fill="both", padx=16, pady=16)
+
+        ctk.CTkLabel(
+            wrap, text="◆", font=F(size=44), text_color=ACCENT_GLOW,
+        ).pack(pady=(24, 6))
+        ctk.CTkLabel(
+            wrap, text="Android ROM Extractor",
+            font=F(size=18, weight="bold"), text_color=TEXT,
+        ).pack()
+        ctk.CTkLabel(
+            wrap, text=f"v{__version__}",
+            font=F(size=11), text_color=TEXT_MUTED,
+        ).pack(pady=(2, 18))
+        ctk.CTkLabel(
+            wrap,
+            text="Extract partition images from your Android device,\n"
+                 "verify them, and flash them back. Built for tinkerers.",
+            font=F(size=12), text_color=TEXT_DIM,
+            justify="center", wraplength=380,
+        ).pack(padx=24, pady=(0, 8))
+        ctk.CTkLabel(
+            wrap,
+            text=f"Running on: {platform.system()} {platform.release()}  ·  "
+                 f"Python {platform.python_version()}",
+            font=F(size=10), text_color=TEXT_MUTED,
+        ).pack(pady=(8, 18))
+
+        ctk.CTkButton(
+            wrap, text="Close", command=self.destroy,
+            height=34, width=120,
+            fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="#fff",
+            font=F(size=12, weight="bold"), corner_radius=8,
+        ).pack(pady=(0, 18))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+
 # ----------------------------------------------------------------------------
 # Main app
 # ----------------------------------------------------------------------------
 
 NAV_ITEMS = [
-    ("backup",   "⤓", "Backup"),
-    ("flash",    "⚡", "Flash"),
-    ("restore",  "↩", "Restore"),
-    ("verify",   "✓", "Verify"),
-    ("sideload", "⇪", "Sideload"),
-    ("logs",     "⎘", "Logs"),
+    ("backup",     "⤓", "Backup"),
+    ("flash",      "⚡", "Flash"),
+    ("restore",    "↩", "Restore"),
+    ("verify",     "✓", "Verify"),
+    ("sideload",   "⇪", "Sideload"),
+    ("logcat",     "≡", "Logcat"),
+    ("properties", "ⓘ", "Properties"),
+    ("logs",       "⎘", "Logs"),
 ]
 
 
@@ -405,12 +496,15 @@ class App(ctk.CTk):
 
     def __init__(self) -> None:
         super().__init__()
+        self.settings = settings_mod.Settings.load()
+
         self.title("Android ROM Extractor")
-        self.geometry("1280x820")
+        self.geometry(self.settings.window_geometry or "1280x820")
         self.minsize(1100, 720)
         self.configure(fg_color=BG)
 
         self.current_device: Optional[Device] = None
+        self.all_devices: list[Device] = []
         self.partitions: list[Partition] = []
         self.signal = WorkerSignal()
         self.nav_buttons: dict[str, NavButton] = {}
@@ -419,9 +513,31 @@ class App(ctk.CTk):
         self._toasts: list[ctk.CTkFrame] = []
 
         self._build_layout()
+        self._bind_shortcuts()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.show_view("backup")
         self._poll_signal()
         self.refresh_devices()
+
+    def _on_close(self) -> None:
+        try:
+            self.settings.window_geometry = self.geometry()
+            self.settings.save()
+        finally:
+            self.destroy()
+
+    def _bind_shortcuts(self) -> None:
+        # Cmd/Ctrl+1..8 switch nav, Cmd/Ctrl+R refresh.
+        keys = ["1", "2", "3", "4", "5", "6", "7", "8"]
+        for i, (key, _icon, _label) in enumerate(NAV_ITEMS):
+            if i >= len(keys):
+                break
+            self.bind_all(f"<{MOD_KEY}-Key-{keys[i]}>",
+                          lambda e, k=key: self.show_view(k))
+        self.bind_all(f"<{MOD_KEY}-r>",
+                      lambda e: self.refresh_devices())
+        self.bind_all(f"<{MOD_KEY}-R>",
+                      lambda e: self.refresh_devices())
 
     # ------- layout ----------------------------------------------------------
 
@@ -468,20 +584,32 @@ class App(ctk.CTk):
         self.status_pill = StatusPill(dev_card)
         self.status_pill.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 6))
 
+        self.device_selector = ctk.CTkOptionMenu(
+            dev_card, values=["(no devices)"],
+            command=self._on_device_picked,
+            fg_color=SURFACE_2, button_color=ACCENT,
+            button_hover_color=ACCENT_HOV, text_color=TEXT,
+            font=F(size=11), height=30, dropdown_font=F(size=11),
+        )
+        self.device_selector.grid(row=1, column=0, sticky="ew",
+                                  padx=14, pady=(2, 8))
+        self.device_selector.grid_remove()
+
         self.device_info_label = ctk.CTkLabel(
             dev_card, text="No device connected.\nPlug in a phone via USB.",
             font=F(size=11), text_color=TEXT_MUTED,
             anchor="w", justify="left", wraplength=220,
         )
-        self.device_info_label.grid(row=1, column=0, sticky="ew",
+        self.device_info_label.grid(row=2, column=0, sticky="ew",
                                     padx=14, pady=(0, 10))
 
         ctk.CTkButton(
-            dev_card, text="↻  Refresh", command=self.refresh_devices,
+            dev_card, text=f"↻  Refresh  {MOD_LABEL}R",
+            command=self.refresh_devices,
             height=30, fg_color=SURFACE_2, hover_color=SURFACE_3,
             text_color=TEXT, border_width=1, border_color=BORDER_2,
             font=F(size=11), corner_radius=8,
-        ).grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        ).grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
 
         # Nav
         nav_label = ctk.CTkLabel(
@@ -521,14 +649,25 @@ class App(ctk.CTk):
             ).grid(row=i, column=0, sticky="ew", pady=2, padx=2)
 
         # Footer
-        footer = ctk.CTkLabel(
-            side,
+        footer = ctk.CTkFrame(side, fg_color="transparent")
+        footer.grid(row=100, column=0, sticky="sew", padx=24, pady=(0, 18))
+        footer.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            footer,
             text="Destructive operations are irreversible.\n"
                  "Verify backups before flashing.",
             anchor="w", justify="left",
-            font=F(size=10), text_color=WARN, wraplength=220,
-        )
-        footer.grid(row=100, column=0, sticky="sew", padx=24, pady=(0, 18))
+            font=F(size=10), text_color=WARN, wraplength=200,
+        ).grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkButton(
+            footer, text="About", command=self._show_about,
+            height=26, width=70,
+            fg_color="transparent", hover_color=SURFACE_2,
+            text_color=TEXT_MUTED, font=F(size=11),
+            border_width=0, corner_radius=6,
+        ).grid(row=0, column=1, sticky="se", padx=(8, 0))
 
     def _build_content(self) -> None:
         self.content = ctk.CTkFrame(self, fg_color=BG)
@@ -536,12 +675,14 @@ class App(ctk.CTk):
         self.content.grid_rowconfigure(0, weight=1)
         self.content.grid_columnconfigure(0, weight=1)
 
-        self.views["backup"]   = BackupView(self.content, self)
-        self.views["flash"]    = FlashView(self.content, self)
-        self.views["restore"]  = RestoreView(self.content, self)
-        self.views["verify"]   = VerifyView(self.content, self)
-        self.views["sideload"] = SideloadView(self.content, self)
-        self.views["logs"]     = LogsView(self.content, self)
+        self.views["backup"]     = BackupView(self.content, self)
+        self.views["flash"]      = FlashView(self.content, self)
+        self.views["restore"]    = RestoreView(self.content, self)
+        self.views["verify"]     = VerifyView(self.content, self)
+        self.views["sideload"]   = SideloadView(self.content, self)
+        self.views["logcat"]     = LogcatView(self.content, self)
+        self.views["properties"] = PropertiesView(self.content, self)
+        self.views["logs"]       = LogsView(self.content, self)
 
         for v in self.views.values():
             v.grid(row=0, column=0, sticky="nsew", padx=28, pady=24)
@@ -637,21 +778,50 @@ class App(ctk.CTk):
         _run_thread(work)
 
     def _render_device(self, devs: list[Device]) -> None:
+        self.all_devices = devs
         if not devs:
             self.current_device = None
             self.status_pill.set("idle")
             self.status_pill.set_text("Disconnected")
             self.device_info_label.configure(
                 text="No device connected.\nPlug in a phone via USB.")
+            self.device_selector.grid_remove()
             self.status("No devices attached.", "idle")
+            self.partitions = []
             self._refresh_views()
             return
 
-        # Prefer adb-mode device with root.
+        # Sort: prefer adb-mode device with root for the default pick.
         devs_sorted = sorted(
-            devs, key=lambda d: (0 if d.state == "device" else 1, 0 if d.rooted else 1)
+            devs, key=lambda d: (
+                0 if d.state == "device" else 1,
+                0 if d.rooted else 1,
+            ),
         )
-        d = devs_sorted[0]
+
+        # Multi-device dropdown only when >1.
+        if len(devs) > 1:
+            labels = [self._device_label(d) for d in devs_sorted]
+            self._device_map = dict(zip(labels, devs_sorted))
+            self.device_selector.configure(values=labels)
+            self.device_selector.set(labels[0])
+            self.device_selector.grid()
+        else:
+            self.device_selector.grid_remove()
+
+        self._select_device(devs_sorted[0])
+
+    def _device_label(self, d: Device) -> str:
+        name = d.model if d.model and d.model != "unknown" else d.serial
+        return f"{name} • {d.state}"
+
+    def _on_device_picked(self, label: str) -> None:
+        m = getattr(self, "_device_map", {})
+        d = m.get(label)
+        if d:
+            self._select_device(d)
+
+    def _select_device(self, d: Device) -> None:
         self.current_device = d
 
         state_kind = "ok" if d.state == "device" and d.rooted else "warn"
@@ -681,6 +851,10 @@ class App(ctk.CTk):
         if d.state == "device" and d.rooted:
             self.status(f"Connected to {d.model or d.serial}.", "ok")
             self._load_partitions()
+            # Offer a default output directory the moment a device is ready.
+            bv = self.views.get("backup")
+            if bv and hasattr(bv, "suggest_output_dir"):
+                bv.suggest_output_dir(d)
         else:
             self.status(label_text, state_kind)
             self.partitions = []
@@ -688,10 +862,14 @@ class App(ctk.CTk):
 
     def _load_partitions(self) -> None:
         self.status("Enumerating partitions…", "busy")
+        # Capture serial up front — `current_device` can change before the thread runs.
+        serial = self.current_device.serial if self.current_device else None
+        if not serial:
+            return
 
         def work():
             try:
-                parts = part_mod.list_partitions(serial=self.current_device.serial)
+                parts = part_mod.list_partitions(serial=serial)
                 self.signal.emit({"event": "partitions", "partitions": parts})
             except Exception as e:
                 self.signal.emit({"event": "error", "error": str(e),
@@ -719,6 +897,9 @@ class App(ctk.CTk):
         except Exception as e:
             self.toast(f"Reboot failed: {e}", "err")
             self.log(f"[reboot] failed: {e}")
+
+    def _show_about(self) -> None:
+        AboutDialog(self)
 
     # ------- event dispatcher ------------------------------------------------
 
@@ -759,6 +940,9 @@ class BackupView(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent")
         self.app = app
         self.partition_vars: dict[str, tk.BooleanVar] = {}
+        self.partition_rows: dict[str, ctk.CTkFrame] = {}
+        self._cancel_event: Optional[threading.Event] = None
+        self._backup_started_at: float = 0.0
         self.grid_columnconfigure(0, weight=1)
 
         SectionHeader(
@@ -779,13 +963,24 @@ class BackupView(ctk.CTkFrame):
             text_color=TEXT, placeholder_text="~/backups/galaxy-2026-05-21",
         )
         self.out_entry.grid(row=1, column=0, columnspan=2, padx=(20, 8),
-                            pady=(0, 16), sticky="ew")
+                            pady=(0, 8), sticky="ew")
+        if self.app.settings.last_output_dir:
+            self.out_entry.insert(0, self.app.settings.last_output_dir)
+        self.out_entry.bind("<KeyRelease>", lambda e: self._update_selection_label())
         ctk.CTkButton(
             out_card, text="Browse", command=self._pick, height=36, width=90,
             fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT,
             border_width=1, border_color=BORDER_2, font=F(size=12),
             corner_radius=8,
-        ).grid(row=1, column=2, padx=(0, 20), pady=(0, 16))
+        ).grid(row=1, column=2, padx=(0, 20), pady=(0, 8))
+
+        self.auto_verify = tk.BooleanVar(
+            value=self.app.settings.auto_verify_after_backup)
+        ctk.CTkSwitch(
+            out_card, text="Auto-verify backup when complete",
+            variable=self.auto_verify, progress_color=SUCCESS,
+            font=F(size=12), text_color=TEXT_DIM,
+        ).grid(row=2, column=0, columnspan=3, padx=20, pady=(0, 16), sticky="w")
 
         # Partitions card
         parts_card = Card(self)
@@ -808,15 +1003,24 @@ class BackupView(ctk.CTkFrame):
 
         tool = ctk.CTkFrame(parts_card, fg_color="transparent")
         tool.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
-        for label, cmd in (("Default", self._select_default),
-                           ("All",     lambda: self._set_all(True)),
-                           ("None",    lambda: self._set_all(False))):
+        tool.grid_columnconfigure(3, weight=1)
+        for i, (label, cmd) in enumerate((("Default", self._select_default),
+                                          ("All",     lambda: self._set_all(True)),
+                                          ("None",    lambda: self._set_all(False)))):
             ctk.CTkButton(
                 tool, text=label, command=cmd, height=26, width=68,
                 fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
                 border_width=1, border_color=BORDER_2, font=F(size=11),
                 corner_radius=6,
-            ).pack(side="left", padx=(0, 6))
+            ).grid(row=0, column=i, padx=(0, 6))
+
+        self.search_entry = ctk.CTkEntry(
+            tool, height=26, fg_color=BG_2, border_color=BORDER_2,
+            text_color=TEXT, font=F(size=11),
+            placeholder_text="Search partitions…",
+        )
+        self.search_entry.grid(row=0, column=4, sticky="e", padx=(12, 0))
+        self.search_entry.bind("<KeyRelease>", lambda e: self._apply_filter())
 
         self.parts_container = ctk.CTkFrame(parts_card, fg_color="transparent")
         self.parts_container.grid(row=2, column=0, sticky="nsew",
@@ -883,8 +1087,26 @@ class BackupView(ctk.CTkFrame):
             self.progress_card, height=10, progress_color=ACCENT, fg_color=BG_2,
             corner_radius=4,
         )
-        self.progress_bar.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 16))
+        self.progress_bar.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 8))
         self.progress_bar.set(0)
+
+        prog_foot = ctk.CTkFrame(self.progress_card, fg_color="transparent")
+        prog_foot.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 16))
+        prog_foot.grid_columnconfigure(0, weight=1)
+
+        self.progress_stats = ctk.CTkLabel(
+            prog_foot, text="", anchor="w", font=F_MONO(size=11),
+            text_color=TEXT_MUTED,
+        )
+        self.progress_stats.grid(row=0, column=0, sticky="w")
+
+        self.cancel_btn = ctk.CTkButton(
+            prog_foot, text="Cancel", command=self._cancel_running,
+            height=30, width=90, fg_color=SURFACE_2, hover_color=DANGER_DIM,
+            text_color=DANGER, border_width=1, border_color=DANGER_DIM,
+            font=F(size=12), corner_radius=8, state="disabled",
+        )
+        self.cancel_btn.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         self._running = False
         self.on_device_changed()
@@ -892,10 +1114,56 @@ class BackupView(ctk.CTkFrame):
     # --- behavior ---
 
     def _pick(self):
-        p = filedialog.askdirectory(title="Choose output directory")
+        p = filedialog.askdirectory(
+            title="Choose output directory",
+            initialdir=(self.app.settings.last_output_dir or str(Path.home())),
+        )
         if p:
             self.out_entry.delete(0, "end"); self.out_entry.insert(0, p)
             self._update_selection_label()
+
+    def suggest_output_dir(self, d: Device) -> None:
+        """Pre-fill the output entry with a sensible default — only when empty."""
+        if self.out_entry.get().strip():
+            return
+        import re
+        from datetime import date
+        name = d.model if d.model and d.model != "unknown" else d.serial
+        slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-").lower() or "device"
+        base = Path(self.app.settings.last_output_dir or
+                    str(Path.home() / "arom-backups")).parent
+        # If user had a previous backup root, reuse that directory.
+        if self.app.settings.last_output_dir:
+            base = Path(self.app.settings.last_output_dir).parent
+        else:
+            base = Path.home() / "arom-backups"
+        suggested = base / f"{slug}-{date.today().isoformat()}"
+        self.out_entry.delete(0, "end")
+        self.out_entry.insert(0, str(suggested))
+        self._update_selection_label()
+
+    def _apply_filter(self):
+        needle = self.search_entry.get().strip().lower()
+        visible = 0
+        for name, row in self.partition_rows.items():
+            match = (not needle) or (needle in name.lower())
+            if match:
+                row.grid()
+                visible += 1
+            else:
+                row.grid_remove()
+        if needle:
+            self.app.views["backup"].parts_count.configure(
+                text=f"{visible} of {len(self.partition_rows)} match")
+        else:
+            self.app.views["backup"].parts_count.configure(
+                text=f"{len(self.partition_rows)} found")
+
+    def _cancel_running(self):
+        if self._cancel_event:
+            self._cancel_event.set()
+            self.cancel_btn.configure(state="disabled", text="Cancelling…")
+            self.app.status("Cancelling backup…", "warn")
 
     def _set_all(self, val: bool):
         for name, v in self.partition_vars.items():
@@ -930,6 +1198,7 @@ class BackupView(ctk.CTkFrame):
         for w in self.parts_scroll.winfo_children():
             w.destroy()
         self.partition_vars.clear()
+        self.partition_rows.clear()
 
         if not self.app.partitions:
             self.parts_scroll.grid_remove()
@@ -944,11 +1213,16 @@ class BackupView(ctk.CTkFrame):
         self.parts_scroll.grid()
         self.parts_count.configure(text=f"{len(self.app.partitions)} found")
 
-        default = set(DEFAULT_BACKUP_SET)
+        # Default selection prefers settings if non-empty, else DEFAULT_BACKUP_SET.
+        saved = set(self.app.settings.default_partition_selection)
+        default = saved if saved else set(DEFAULT_BACKUP_SET)
+
         for i, p in enumerate(self.app.partitions):
             row = self._make_partition_row(p, in_default=p.name in default)
             row.grid(row=i, column=0, sticky="ew", padx=4, pady=1)
+            self.partition_rows[p.name] = row
         self._update_selection_label()
+        self._apply_filter()
 
     def _make_partition_row(self, p: Partition, in_default: bool) -> ctk.CTkFrame:
         row = ctk.CTkFrame(self.parts_scroll, fg_color="transparent",
@@ -1026,17 +1300,50 @@ class BackupView(ctk.CTkFrame):
             if not ok:
                 return
 
+        # Disk-space safety: warn if the target volume doesn't have enough room
+        # (with 20% headroom for filesystem overhead / other writes).
+        needed = sum(p.size_bytes or 0 for p in sel)
+        target_root = Path(out).expanduser()
+        probe_dir = target_root if target_root.exists() else target_root.parent
+        while probe_dir != probe_dir.parent and not probe_dir.exists():
+            probe_dir = probe_dir.parent
+        try:
+            free = shutil.disk_usage(probe_dir).free
+        except Exception:
+            free = None
+        if free is not None and free < int(needed * 1.2):
+            ok = ConfirmDialog.ask(
+                self.app,
+                title="Not enough free disk space",
+                body=(f"This backup needs ~{human_size(needed)} (plus headroom).\n"
+                      f"Free on {probe_dir}: {human_size(free)}.\n\n"
+                      "Continue anyway?"),
+                confirm_text="Continue", danger=True,
+            )
+            if not ok:
+                return
+
         out_dir = Path(out)
         total_bytes = sum(p.size_bytes or 0 for p in sel) or 1
         bytes_done = 0
         per_part_total = {p.name: (p.size_bytes or 0) for p in sel}
 
+        # Persist user choices.
+        self.app.settings.last_output_dir = str(out_dir)
+        self.app.settings.default_partition_selection = [p.name for p in sel]
+        self.app.settings.auto_verify_after_backup = self.auto_verify.get()
+        self.app.settings.save()
+
         self._running = True
+        self._cancel_event = threading.Event()
+        self._backup_started_at = time.monotonic()
         self.start_btn.configure(state="disabled", text="Running…")
+        self.cancel_btn.configure(state="normal", text="Cancel")
         self.progress_card.grid(row=4, column=0, sticky="ew", pady=(14, 0))
         self.progress_title.configure(text="Starting…")
         self.progress_sub.configure(text="")
         self.progress_pct.configure(text="0%")
+        self.progress_stats.configure(text="")
         self.progress_bar.set(0)
         self.app.status(f"Backing up {len(sel)} partitions…", "busy")
         self.app.log(f"[backup] -> {out_dir}; partitions: "
@@ -1045,6 +1352,8 @@ class BackupView(ctk.CTkFrame):
 
         device = self.app.current_device
         signal = self.app.signal
+        cancel_event = self._cancel_event
+        do_verify = self.auto_verify.get()
 
         def emit(ev: dict) -> None:
             nonlocal bytes_done
@@ -1064,7 +1373,13 @@ class BackupView(ctk.CTkFrame):
                 entries = backup_mod.backup_partitions(
                     device=device, parts=sel, out_dir=out_dir,
                     verify_on_device=True, events=emit,
+                    cancel=cancel_event,
                 )
+                if not entries:
+                    # Cancelled before any entry was completed.
+                    signal.emit({"event": "_backup_aborted",
+                                 "out": str(out_dir)})
+                    return
                 manifest = Manifest.new(device_info={
                     "serial": device.serial, "model": device.model,
                     "fingerprint": device.fingerprint, "chipset": device.chipset,
@@ -1074,7 +1389,9 @@ class BackupView(ctk.CTkFrame):
                 manifest.partitions = entries
                 manifest.write(out_dir / MANIFEST_FILENAME)
                 signal.emit({"event": "_backup_complete", "out": str(out_dir),
-                             "count": len(entries)})
+                             "count": len(entries),
+                             "do_verify": do_verify,
+                             "cancelled": cancel_event.is_set()})
             except Exception as e:
                 signal.emit({"event": "error", "error": str(e),
                              "trace": traceback.format_exc()})
@@ -1099,22 +1416,65 @@ class BackupView(ctk.CTkFrame):
             cur_h = human_size(ev["bytes_done"])
             tot_h = human_size(ev["total_bytes"])
             self.progress_sub.configure(text=f"{cur_h} / {tot_h}")
+
+            elapsed = max(0.001, time.monotonic() - self._backup_started_at)
+            speed = ev["bytes_done"] / elapsed
+            remaining = ev["total_bytes"] - ev["bytes_done"]
+            eta_s = remaining / speed if speed > 0 else 0
+            self.progress_stats.configure(
+                text=f"{human_size(int(speed))}/s   ·   "
+                     f"ETA {_fmt_eta(eta_s)}   ·   "
+                     f"elapsed {_fmt_eta(elapsed)}"
+            )
         elif kind == "_backup_done":
             self.app.log(f"[backup] OK    {ev['name']}  sha256={ev['sha256'][:12]}…  "
                          f"size={human_size(ev['written'])}")
         elif kind == "_backup_error":
             self.app.log(f"[backup] FAIL  {ev['name']}: {ev['error']}")
             self.app.toast(f"{ev['name']}: {ev['error']}", "err")
+        elif kind == "_backup_cancelled":
+            self.app.log(f"[backup] CANCELLED at {ev['name']}")
         elif kind == "_backup_complete":
-            self.app.log(f"[backup] COMPLETE — {ev['count']} partitions in {ev['out']}")
-            self.app.toast(f"Backup complete — {ev['count']} partitions saved.", "ok")
-            self.app.status(f"Backup complete in {ev['out']}.", "ok")
-            self.progress_title.configure(text="Backup complete")
-            self.progress_bar.set(1.0)
-            self.progress_pct.configure(text="100%")
+            cancelled = ev.get("cancelled", False)
+            self.app.settings.push_recent_backup(ev["out"])
+            self.app.settings.save()
+            if cancelled:
+                msg = f"Backup cancelled after {ev['count']} partitions."
+                kind_ = "warn"
+            else:
+                msg = f"Backup complete — {ev['count']} partitions saved."
+                kind_ = "ok"
+            self.app.log(f"[backup] {'CANCELLED' if cancelled else 'COMPLETE'} "
+                         f"— {ev['count']} partitions in {ev['out']}")
+            self.app.toast(msg, kind_)
+            self.app.status(msg, kind_)
+            self.progress_title.configure(
+                text="Backup cancelled" if cancelled else "Backup complete")
+            self.progress_pct.configure(text=f"{int(self.progress_bar.get()*100)}%"
+                                        if cancelled else "100%")
+            if not cancelled:
+                self.progress_bar.set(1.0)
+            if ev.get("do_verify") and not cancelled:
+                self.after(400, lambda out=ev["out"]: self._kick_auto_verify(out))
+        elif kind == "_backup_aborted":
+            self.app.log("[backup] cancelled before any partition completed")
+            self.app.toast("Backup cancelled.", "warn")
+            self.app.status("Backup cancelled.", "warn")
+            self.progress_title.configure(text="Backup cancelled")
         elif kind == "_backup_finished":
             self._running = False
+            self._cancel_event = None
             self.start_btn.configure(state="normal", text="Start backup →")
+            self.cancel_btn.configure(state="disabled", text="Cancel")
+
+    def _kick_auto_verify(self, out_dir: str) -> None:
+        v = self.app.views.get("verify")
+        if not v:
+            return
+        v.dir_entry.delete(0, "end")
+        v.dir_entry.insert(0, out_dir)
+        self.app.show_view("verify")
+        v._verify()
 
 
 class FlashView(ctk.CTkFrame):
@@ -1232,26 +1592,32 @@ class FlashView(ctk.CTkFrame):
             title="Choose image file",
             filetypes=[("Images", "*.img *.bin"), ("All files", "*.*")],
         )
-        if p:
-            self.image_entry.delete(0, "end"); self.image_entry.insert(0, p)
+        if not p:
+            return
+        self.image_entry.delete(0, "end"); self.image_entry.insert(0, p)
+        try:
+            size = Path(p).stat().st_size
+            self.output.delete("1.0", "end")
+            self.output.insert("end",
+                f"file:     {p}\n"
+                f"size:     {human_size(size)}\n"
+                f"sha256:   computing…\n"
+            )
+        except Exception as e:
+            self.output.insert("end", f"\nerror reading file: {e}\n")
+            return
+
+        signal = self.app.signal
+
+        def work():
             try:
-                size = Path(p).stat().st_size
-                self.output.delete("1.0", "end")
-                self.output.insert("end",
-                    f"file:     {p}\n"
-                    f"size:     {human_size(size)}\n"
-                    f"sha256:   computing…\n"
-                )
-                self.update_idletasks()
                 sha = sha256_file(Path(p))
-                self.output.delete("1.0", "end")
-                self.output.insert("end",
-                    f"file:     {p}\n"
-                    f"size:     {human_size(size)}\n"
-                    f"sha256:   {sha}\n"
-                )
+                signal.emit({"event": "_flash_hash", "file": p,
+                             "size": size, "sha": sha})
             except Exception as e:
-                self.output.insert("end", f"\nerror reading file: {e}\n")
+                signal.emit({"event": "_flash_hash_err", "error": str(e)})
+
+        _run_thread(work)
 
     def on_device_changed(self) -> None:
         opts = sorted({p.name for p in self.app.partitions})
@@ -1325,6 +1691,17 @@ class FlashView(ctk.CTkFrame):
             self.app.status(msg, "ok")
         elif kind == "_flash_finished":
             self.flash_btn.configure(state="normal", text="Flash image")
+        elif kind == "_flash_hash":
+            # Only update if user hasn't moved on to a different file.
+            if self.image_entry.get().strip() == ev["file"]:
+                self.output.delete("1.0", "end")
+                self.output.insert("end",
+                    f"file:     {ev['file']}\n"
+                    f"size:     {human_size(ev['size'])}\n"
+                    f"sha256:   {ev['sha']}\n"
+                )
+        elif kind == "_flash_hash_err":
+            self.output.insert("end", f"\nhash error: {ev['error']}\n")
 
 
 class RestoreView(ctk.CTkFrame):
@@ -1352,8 +1729,16 @@ class RestoreView(ctk.CTkFrame):
             card, height=36, fg_color=BG_2, border_color=BORDER_2,
             text_color=TEXT, placeholder_text="path/to/backup-…",
         )
-        self.dir_entry.grid(row=1, column=0, columnspan=2,
-                            padx=(20, 8), pady=(0, 14), sticky="ew")
+        self.dir_entry.grid(row=1, column=0, padx=(20, 8), pady=(0, 14),
+                            sticky="ew")
+        self.recent_btn = ctk.CTkButton(
+            card, text="Recent ▾", command=self._show_recent,
+            height=36, width=84,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
+            border_width=1, border_color=BORDER_2, font=F(size=12),
+            corner_radius=8,
+        )
+        self.recent_btn.grid(row=1, column=1, padx=(0, 8), pady=(0, 14))
         ctk.CTkButton(
             card, text="Browse", command=self._pick, height=36, width=90,
             fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT,
@@ -1405,9 +1790,32 @@ class RestoreView(ctk.CTkFrame):
         self.output.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 16))
 
     def _pick(self):
-        p = filedialog.askdirectory(title="Choose backup directory")
+        initial = self.app.settings.last_backup_dir or self.app.settings.last_output_dir
+        p = filedialog.askdirectory(title="Choose backup directory",
+                                    initialdir=initial or str(Path.home()))
         if p:
             self.dir_entry.delete(0, "end"); self.dir_entry.insert(0, p)
+            self.app.settings.last_backup_dir = p
+            self.app.settings.save()
+
+    def _show_recent(self):
+        recent = self.app.settings.recent_backups
+        if not recent:
+            self.app.toast("No recent backups yet.", "info")
+            return
+        menu = tk.Menu(self, tearoff=False)
+        for path in recent:
+            menu.add_command(label=path,
+                             command=lambda p=path: self._pick_recent(p))
+        try:
+            menu.tk_popup(self.recent_btn.winfo_rootx(),
+                          self.recent_btn.winfo_rooty()
+                              + self.recent_btn.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _pick_recent(self, path: str):
+        self.dir_entry.delete(0, "end"); self.dir_entry.insert(0, path)
 
     def on_device_changed(self): pass
     def on_show(self): pass
@@ -1491,8 +1899,16 @@ class VerifyView(ctk.CTkFrame):
             card, height=36, fg_color=BG_2, border_color=BORDER_2,
             text_color=TEXT, placeholder_text="path/to/backup-…",
         )
-        self.dir_entry.grid(row=1, column=0, columnspan=2,
-                            padx=(20, 8), pady=(0, 16), sticky="ew")
+        self.dir_entry.grid(row=1, column=0, padx=(20, 8), pady=(0, 16),
+                            sticky="ew")
+        self.recent_btn = ctk.CTkButton(
+            card, text="Recent ▾", command=self._show_recent,
+            height=36, width=84,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
+            border_width=1, border_color=BORDER_2, font=F(size=12),
+            corner_radius=8,
+        )
+        self.recent_btn.grid(row=1, column=1, padx=(0, 8), pady=(0, 16))
         ctk.CTkButton(
             card, text="Browse", command=self._pick, height=36, width=90,
             fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT,
@@ -1530,9 +1946,32 @@ class VerifyView(ctk.CTkFrame):
         self.results.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 16))
 
     def _pick(self):
-        p = filedialog.askdirectory(title="Choose backup directory")
+        initial = self.app.settings.last_backup_dir or self.app.settings.last_output_dir
+        p = filedialog.askdirectory(title="Choose backup directory",
+                                    initialdir=initial or str(Path.home()))
         if p:
             self.dir_entry.delete(0, "end"); self.dir_entry.insert(0, p)
+            self.app.settings.last_backup_dir = p
+            self.app.settings.save()
+
+    def _show_recent(self):
+        recent = self.app.settings.recent_backups
+        if not recent:
+            self.app.toast("No recent backups yet.", "info")
+            return
+        menu = tk.Menu(self, tearoff=False)
+        for path in recent:
+            menu.add_command(label=path,
+                             command=lambda p=path: self._pick_recent(p))
+        try:
+            menu.tk_popup(self.recent_btn.winfo_rootx(),
+                          self.recent_btn.winfo_rooty()
+                              + self.recent_btn.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _pick_recent(self, path: str):
+        self.dir_entry.delete(0, "end"); self.dir_entry.insert(0, path)
 
     def on_device_changed(self): pass
     def on_show(self): pass
@@ -1708,7 +2147,7 @@ class SideloadView(ctk.CTkFrame):
         self.output.insert("end",
             f"zip:      {zp}\n"
             f"size:     {human_size(zp.stat().st_size)}\n"
-            f"sha256:   {sha256_file(zp)}\n"
+            f"sha256:   computing…\n"
             "streaming via adb sideload…\n"
         )
         self.sl_btn.configure(state="disabled", text="Sideloading…")
@@ -1718,6 +2157,9 @@ class SideloadView(ctk.CTkFrame):
 
         def work():
             try:
+                # Hash in background so the UI doesn't freeze on big ZIPs.
+                sha = sha256_file(zp)
+                signal.emit({"event": "_sideload_hash", "zip": str(zp), "sha": sha})
                 flash_mod.sideload_zip(zp, serial=serial, dry_run=False,
                                       assume_yes=True)
                 signal.emit({"event": "_sideload_done"})
@@ -1737,6 +2179,12 @@ class SideloadView(ctk.CTkFrame):
             self.app.status("Sideload complete.", "ok")
         elif kind == "_sideload_finished":
             self.sl_btn.configure(state="normal", text="Sideload")
+        elif kind == "_sideload_hash":
+            # Replace the "computing…" line with the actual hash.
+            text = self.output.get("1.0", "end")
+            text = text.replace("sha256:   computing…", f"sha256:   {ev['sha']}")
+            self.output.delete("1.0", "end")
+            self.output.insert("end", text)
 
 
 class LogsView(ctk.CTkFrame):
@@ -1777,6 +2225,364 @@ class LogsView(ctk.CTkFrame):
 
     def on_device_changed(self): pass
     def on_show(self): pass
+
+
+class LogcatView(ctk.CTkFrame):
+    """Streams `adb logcat -v threadtime` from the connected device."""
+
+    LEVEL_COLORS = {
+        "V": TEXT_MUTED, "D": TEXT_DIM, "I": INFO,
+        "W": WARN, "E": DANGER, "F": DANGER,
+    }
+
+    def __init__(self, master, app: App):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self._proc: Optional[subprocess.Popen] = None
+        self._reader: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lines_seen = 0
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        SectionHeader(
+            self, icon="≡", title="Logcat",
+            subtitle="Live stream of the device's system log.",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 18))
+
+        # Controls
+        controls = Card(self)
+        controls.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+        controls.grid_columnconfigure(2, weight=1)
+
+        self.start_btn = ctk.CTkButton(
+            controls, text="▶  Start", command=self._start,
+            height=34, width=110,
+            fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="#fff",
+            font=F(size=12, weight="bold"), corner_radius=8,
+        )
+        self.start_btn.grid(row=0, column=0, padx=(16, 8), pady=12)
+
+        self.stop_btn = ctk.CTkButton(
+            controls, text="■  Stop", command=self._stop,
+            height=34, width=90,
+            fg_color=SURFACE_2, hover_color=DANGER_DIM, text_color=DANGER,
+            border_width=1, border_color=DANGER_DIM,
+            font=F(size=12), corner_radius=8, state="disabled",
+        )
+        self.stop_btn.grid(row=0, column=1, padx=(0, 8), pady=12)
+
+        self.filter_entry = ctk.CTkEntry(
+            controls, height=34, fg_color=BG_2, border_color=BORDER_2,
+            text_color=TEXT, font=F(size=12),
+            placeholder_text="Filter lines (case-insensitive substring)",
+        )
+        self.filter_entry.grid(row=0, column=2, padx=(0, 8), pady=12, sticky="ew")
+
+        self.level_combo = ctk.CTkComboBox(
+            controls, values=["All", "V", "D", "I", "W", "E", "F"],
+            height=34, width=80,
+            fg_color=BG_2, border_color=BORDER_2,
+            button_color=ACCENT, button_hover_color=ACCENT_HOV,
+            text_color=TEXT, font=F(size=12),
+        )
+        self.level_combo.set("All")
+        self.level_combo.grid(row=0, column=3, padx=(0, 8), pady=12)
+
+        ctk.CTkButton(
+            controls, text="Clear", command=self._clear,
+            height=34, width=80,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
+            border_width=1, border_color=BORDER_2,
+            font=F(size=12), corner_radius=8,
+        ).grid(row=0, column=4, padx=(0, 8), pady=12)
+
+        ctk.CTkButton(
+            controls, text="Save…", command=self._save,
+            height=34, width=80,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
+            border_width=1, border_color=BORDER_2,
+            font=F(size=12), corner_radius=8,
+        ).grid(row=0, column=5, padx=(0, 16), pady=12)
+
+        # Body
+        body = Card(self)
+        body.grid(row=2, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        self.box = ctk.CTkTextbox(
+            body, fg_color=BG_2, text_color=TEXT_DIM,
+            font=F_MONO(size=11), corner_radius=8, wrap="none",
+        )
+        self.box.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        # Color tags for level prefixes.
+        for level, color in self.LEVEL_COLORS.items():
+            self.box.tag_config(f"lvl_{level}", foreground=color)
+
+        # Footer status line.
+        self.stat = ctk.CTkLabel(
+            self, text="Idle.", anchor="w",
+            font=F(size=11), text_color=TEXT_MUTED,
+        )
+        self.stat.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+
+    def on_device_changed(self) -> None:
+        if self._proc and self.app.current_device is None:
+            self._stop()
+
+    def on_show(self) -> None:
+        pass
+
+    def _start(self) -> None:
+        if self._proc is not None:
+            return
+        d = self.app.current_device
+        if not d or d.state != "device":
+            self.app.toast("Connect a device in adb mode first.", "warn")
+            return
+
+        # Spawn `adb logcat -v threadtime` and stream stdout into the textbox.
+        try:
+            from .adb import _adb_binary
+            args = [_adb_binary(), "-s", d.serial, "logcat", "-v", "threadtime"]
+            self._proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
+            )
+        except Exception as e:
+            self.app.toast(f"Could not start logcat: {e}", "err")
+            return
+
+        self._stop_event.clear()
+        self._lines_seen = 0
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.stat.configure(text=f"Streaming logcat from {d.serial}…",
+                            text_color=ACCENT_GLOW)
+        self.app.status("Logcat running.", "busy")
+
+        signal = self.app.signal
+        proc = self._proc
+        stop_event = self._stop_event
+
+        def reader():
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if stop_event.is_set():
+                        break
+                    signal.emit({"event": "_logcat_line", "line": line.rstrip()})
+            except Exception as e:
+                signal.emit({"event": "_logcat_line",
+                             "line": f"[reader error: {e}]"})
+            finally:
+                signal.emit({"event": "_logcat_done"})
+
+        self._reader = threading.Thread(target=reader, daemon=True)
+        self._reader.start()
+
+    def _stop(self) -> None:
+        self._stop_event.set()
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        self._proc = None
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.stat.configure(
+            text=f"Stopped — {self._lines_seen} lines captured.",
+            text_color=TEXT_MUTED,
+        )
+        self.app.status("Logcat stopped.", "idle")
+
+    def _clear(self) -> None:
+        self.box.delete("1.0", "end")
+        self._lines_seen = 0
+        self.stat.configure(text="Cleared.")
+
+    def _save(self) -> None:
+        text = self.box.get("1.0", "end").rstrip()
+        if not text:
+            self.app.toast("Nothing to save yet.", "info")
+            return
+        p = filedialog.asksaveasfilename(
+            title="Save logcat",
+            defaultextension=".log",
+            initialfile=f"logcat-{int(time.time())}.log",
+            filetypes=[("Log files", "*.log"), ("All files", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            Path(p).write_text(text)
+            self.app.toast(f"Saved {Path(p).name}.", "ok")
+        except Exception as e:
+            self.app.toast(f"Save failed: {e}", "err")
+
+    def _passes_filter(self, line: str) -> bool:
+        needle = self.filter_entry.get().strip().lower()
+        if needle and needle not in line.lower():
+            return False
+        level = self.level_combo.get()
+        if level != "All":
+            # `threadtime`: "MM-DD HH:MM:SS.SSS PID TID L tag: msg"
+            parts = line.split()
+            if len(parts) >= 5 and parts[4] != level:
+                return False
+        return True
+
+    def handle_event(self, ev: dict) -> None:
+        kind = ev.get("event", "")
+        if kind == "_logcat_line":
+            line = ev["line"]
+            if not self._passes_filter(line):
+                return
+            # Detect level for colorizing.
+            parts = line.split()
+            level = parts[4] if len(parts) >= 5 else None
+            tag = f"lvl_{level}" if level in self.LEVEL_COLORS else None
+            if tag:
+                self.box.insert("end", line + "\n", (tag,))
+            else:
+                self.box.insert("end", line + "\n")
+            self._lines_seen += 1
+            # Keep buffer manageable (last 8000 lines).
+            line_count = int(self.box.index("end-1c").split(".")[0])
+            if line_count > 8000:
+                self.box.delete("1.0", "2000.0")
+            self.box.see("end")
+            self.stat.configure(text=f"Streaming — {self._lines_seen} lines")
+        elif kind == "_logcat_done":
+            self._stop()
+
+
+class PropertiesView(ctk.CTkFrame):
+    """Searchable browser of the device's `getprop` output."""
+
+    def __init__(self, master, app: App):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        SectionHeader(
+            self, icon="ⓘ", title="Properties",
+            subtitle="All Android system properties from the connected device.",
+            actions=[("Copy JSON", self._copy_json),
+                     ("Refresh",   self._refresh)],
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 18))
+
+        # Search box
+        search_row = ctk.CTkFrame(self, fg_color="transparent")
+        search_row.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        search_row.grid_columnconfigure(0, weight=1)
+        self.search = ctk.CTkEntry(
+            search_row, height=34, fg_color=SURFACE, border_color=BORDER_2,
+            text_color=TEXT, font=F(size=12),
+            placeholder_text="Filter properties (e.g. ro.product, hardware, build)",
+        )
+        self.search.grid(row=0, column=0, sticky="ew")
+        self.search.bind("<KeyRelease>", lambda e: self._render())
+        self.count_label = ctk.CTkLabel(
+            search_row, text="", font=F(size=11), text_color=TEXT_MUTED,
+        )
+        self.count_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
+
+        # Body
+        self.card = Card(self)
+        self.card.grid(row=2, column=0, sticky="nsew")
+        self.card.grid_columnconfigure(0, weight=1)
+        self.card.grid_rowconfigure(0, weight=1)
+
+        self.scroll = ctk.CTkScrollableFrame(
+            self.card, fg_color=BG_2, corner_radius=8,
+        )
+        self.scroll.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        self.scroll.grid_columnconfigure(1, weight=1)
+
+        self.empty = EmptyState(
+            self.card, icon="📡",
+            title="No device connected",
+            body="Connect a phone in adb mode to browse its system properties.",
+            action=("Refresh", self.app.refresh_devices),
+        )
+
+    def _refresh(self):
+        self.app.refresh_devices()
+
+    def _copy_json(self):
+        d = self.app.current_device
+        if not d:
+            self.app.toast("No device connected.", "warn")
+            return
+        self.app.clipboard_clear()
+        self.app.clipboard_append(json.dumps(d.properties, indent=2, sort_keys=True))
+        self.app.toast("Properties JSON copied.", "ok")
+
+    def on_device_changed(self) -> None:
+        self._render()
+
+    def on_show(self) -> None:
+        self._render()
+
+    def _render(self) -> None:
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        d = self.app.current_device
+        props = d.properties if d else {}
+
+        if not props:
+            self.scroll.grid_remove()
+            self.empty.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+            self.count_label.configure(text="")
+            return
+
+        self.empty.grid_remove()
+        self.scroll.grid()
+
+        needle = self.search.get().strip().lower()
+        shown = 0
+        for i, key in enumerate(sorted(props)):
+            val = props[key]
+            if needle and needle not in key.lower() and needle not in val.lower():
+                continue
+            row = ctk.CTkFrame(self.scroll, fg_color="transparent")
+            row.grid(row=i, column=0, sticky="ew", pady=1)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                row, text=key, anchor="w", font=F_MONO(size=11),
+                text_color=ACCENT_GLOW, width=260,
+            ).grid(row=0, column=0, sticky="w", padx=(6, 12))
+            ctk.CTkLabel(
+                row, text=val or "(empty)", anchor="w", font=F_MONO(size=11),
+                text_color=TEXT_DIM, wraplength=600, justify="left",
+            ).grid(row=0, column=1, sticky="w")
+            shown += 1
+
+        if needle:
+            self.count_label.configure(
+                text=f"{shown} of {len(props)} match")
+        else:
+            self.count_label.configure(text=f"{len(props)} properties")
+
+    def handle_event(self, ev: dict) -> None:
+        pass
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Format seconds as mm:ss or h:mm:ss."""
+    if seconds < 0 or seconds == float("inf"):
+        return "—"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 # ----------------------------------------------------------------------------

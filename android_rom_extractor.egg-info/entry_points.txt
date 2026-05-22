@@ -1,0 +1,3 @@
+[console_scripts]
+arom = rom_extractor.cli:main
+arom-gui = rom_extractor.gui:run
