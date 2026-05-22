@@ -10,10 +10,12 @@ setup(
     install_requires=[
         "rich>=13.0",
         "click>=8.1",
+        "customtkinter>=5.2",
     ],
     entry_points={
         "console_scripts": [
             "arom = rom_extractor.cli:main",
+            "arom-gui = rom_extractor.gui:run",
         ],
     },
 )

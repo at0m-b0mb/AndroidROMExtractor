@@ -38,7 +38,28 @@ cd AndroidROMExtractor
 pip install -e .
 ```
 
-This installs the `arom` command.
+This installs two commands:
+- `arom`     — the CLI
+- `arom-gui` — a dark-mode desktop GUI (customtkinter)
+
+## GUI
+
+Launch the GUI with:
+
+```bash
+arom-gui
+```
+
+You get:
+- Sidebar with device selector, properties (model / chipset / root / fingerprint), and reboot-to buttons
+- **Backup tab**: scrollable partition list with checkboxes, danger/MTK/large tags, live progress bar, default-set / select-all / clear buttons
+- **Flash tab**: image picker + partition dropdown, boot-only switch, dangerous-partition override switch
+- **Restore tab**: backup-dir picker, optional userdata, optional dangerous partitions
+- **Verify tab**: per-file SHA-256 results
+- **Sideload tab**: ZIP picker
+- **Logs tab**: every event in one place
+
+Long operations run on a background thread and stream events back to the UI through a queue, so the window stays responsive.
 
 ---
 
