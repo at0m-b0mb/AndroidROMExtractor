@@ -92,5 +92,14 @@ def find(name: str, partitions: list[Partition]) -> Optional[Partition]:
 
 
 def is_dangerous(name: str) -> bool:
-    base = name.rstrip("_a").rstrip("_b")
-    return name in DANGEROUS_PARTITIONS or base in DANGEROUS_PARTITIONS
+    # str.rstrip removes any *character* in the argument, not a suffix —
+    # e.g. "banana_a".rstrip("_a") -> "bn". Use removesuffix for the real
+    # A/B-slot strip, then check both the original and the stripped name.
+    if name in DANGEROUS_PARTITIONS:
+        return True
+    base = name
+    for suf in ("_a", "_b"):
+        if base.endswith(suf):
+            base = base[: -len(suf)]
+            break
+    return base in DANGEROUS_PARTITIONS

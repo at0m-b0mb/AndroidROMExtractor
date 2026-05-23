@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import logging
+import platform
+import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -158,6 +161,98 @@ def discover() -> list[Device]:
         devices.append(Device(serial=serial, state="fastboot", properties=props))
 
     return devices
+
+
+# --- MediaTek preloader / BROM detection ------------------------------------
+# When a MTK phone is in download (preloader) or BROM mode, neither adb nor
+# fastboot can see it — only raw USB enumeration. Detecting this lets the GUI
+# tell the user "you need mtkclient / SP Flash Tool" instead of "no device".
+
+MTK_VID = 0x0e8d
+MTK_PIDS = {
+    0x2000: "MT65xx Preloader (download mode)",
+    0x0003: "MT BROM (boot ROM mode)",
+    0x2001: "MT preloader (alt)",
+}
+
+
+@dataclass
+class MtkUsbDevice:
+    pid: int
+    description: str
+
+    @property
+    def vid_pid(self) -> str:
+        return f"{MTK_VID:04x}:{self.pid:04x}"
+
+
+def detect_mtk_preloader() -> list[MtkUsbDevice]:
+    """Best-effort detection of a MediaTek phone in preloader/BROM mode.
+
+    Currently macOS-only (system_profiler). Returns [] on other platforms or
+    when no MTK device is found. Never raises.
+    """
+    if platform.system() != "Darwin":
+        return []
+    try:
+        out = subprocess.run(
+            ["system_profiler", "SPUSBDataType"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    # system_profiler emits one indented block per USB device, looking like:
+    #     <DeviceName>:
+    #
+    #       Product ID: 0x2000
+    #       Vendor ID: 0x0e8d  (MediaTek Inc.)
+    #       Version: 1.00
+    #       ...
+    # Field order varies by macOS version. Walk line-by-line: when the
+    # indentation level shrinks or a new device label appears, reset the
+    # pending vid/pid pair.
+    found: list[MtkUsbDevice] = []
+    seen: set[int] = set()
+    pending_vid: Optional[int] = None
+    pending_pid: Optional[int] = None
+    pending_indent = -1
+
+    def commit():
+        if pending_vid == MTK_VID and pending_pid is not None \
+                and pending_pid not in seen:
+            seen.add(pending_pid)
+            desc = MTK_PIDS.get(
+                pending_pid, f"MediaTek device (pid 0x{pending_pid:04x})")
+            found.append(MtkUsbDevice(pid=pending_pid, description=desc))
+
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        # A device-label line ends with `:` and has no `0x` / no value.
+        is_label = line.rstrip().endswith(":") and "0x" not in line
+        # New device block (dedent to a label) -> commit current.
+        if is_label and indent <= pending_indent:
+            commit()
+            pending_vid = pending_pid = None
+            pending_indent = indent
+            continue
+        if is_label:
+            pending_indent = indent
+            continue
+        m_vid = re.search(r"Vendor ID:\s*0x0*([0-9a-fA-F]+)", line)
+        m_pid = re.search(r"Product ID:\s*0x0*([0-9a-fA-F]+)", line)
+        if m_vid:
+            pending_vid = int(m_vid.group(1), 16)
+        if m_pid:
+            pending_pid = int(m_pid.group(1), 16)
+        # Commit eagerly once we have both — handles the very last block too.
+        if pending_vid is not None and pending_pid is not None:
+            commit()
+            pending_vid = pending_pid = None
+    commit()
+    return found
 
 
 def pick_one(devices: list[Device], requested: Optional[str] = None) -> Device:

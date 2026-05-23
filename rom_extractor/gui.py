@@ -24,7 +24,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 from . import __version__, adb as adb_mod, apps as apps_mod, backup as backup_mod
-from . import device as device_mod, flash as flash_mod
+from . import device as device_mod, fastboot as fastboot_mod, flash as flash_mod
 from . import partitions as part_mod
 from . import settings as settings_mod
 from . import verify as verify_mod
@@ -74,6 +74,66 @@ DANGER_HOV  = "#dc2626"
 DANGER_DIM  = "#7f1d1d"
 INFO        = "#06b6d4"
 MTK         = "#a78bfa"   # violet
+
+def device_unavailable_copy(d: Optional[Device], purpose: str,
+                            requires_root: bool = False
+                            ) -> tuple[str, str, str]:
+    """Return (title, body, hint) explaining why `purpose` can't run right now.
+    Returns None values shouldn't happen — callers should only call this when
+    the device isn't usable for the purpose (None / wrong state / no root)."""
+    if d is None:
+        return (
+            "No device connected",
+            f"Connect a phone via USB and click Refresh in the sidebar to "
+            f"{purpose}. If nothing shows up, check that USB debugging is on "
+            f"and the cable is data-capable.",
+            "Connect a device to continue.",
+        )
+    if d.state == "fastboot":
+        return (
+            "Device is in fastboot mode",
+            f"This page needs Android booted with USB debugging on to "
+            f"{purpose}. Tap '⏻ System' in the sidebar to reboot.",
+            f"Device in fastboot mode — reboot to system to {purpose}.",
+        )
+    if d.state in ("recovery", "sideload"):
+        return (
+            f"Device is in {d.state} mode",
+            f"This page needs Android booted with USB debugging on to "
+            f"{purpose}. Tap '⏻ System' in the sidebar to reboot.",
+            f"Device in {d.state} mode — reboot to system to {purpose}.",
+        )
+    if d.state == "unauthorized":
+        return (
+            "Device is unauthorized",
+            "Unlock the phone and tap 'Allow' on the USB-debugging prompt. "
+            "If you don't see it, toggle USB debugging off and on in "
+            "Developer options, then click Refresh.",
+            "Accept the USB-debug prompt on the phone.",
+        )
+    if d.state == "offline":
+        return (
+            "Device is offline",
+            "Replug the USB cable and click Refresh in the sidebar. If the "
+            "device stays offline, try a different cable or port.",
+            "Device is offline — reconnect to continue.",
+        )
+    # state == "device" but root missing
+    if requires_root and not d.rooted:
+        return (
+            "Root not available",
+            f"This page needs root (su) to {purpose}. Make sure Magisk/SuperSU "
+            f"is installed and the device has granted shell access, then click "
+            f"Refresh.",
+            "Root required to continue.",
+        )
+    # Fallback — shouldn't normally land here.
+    return (
+        f"Device state: {d.state}",
+        f"Cannot {purpose} from the current state.",
+        f"State {d.state!r} not supported.",
+    )
+
 
 # Font helpers (resolved at App.__init__)
 def F(size=13, weight="normal"):
@@ -267,13 +327,15 @@ class EmptyState(ctk.CTkFrame):
         ctk.CTkLabel(
             wrap, text=icon, font=F(size=56), text_color=TEXT_MUTED,
         ).pack(pady=(0, 12))
-        ctk.CTkLabel(
+        self._title_lbl = ctk.CTkLabel(
             wrap, text=title, font=F(size=18, weight="bold"), text_color=TEXT,
-        ).pack(pady=(0, 6))
-        ctk.CTkLabel(
+        )
+        self._title_lbl.pack(pady=(0, 6))
+        self._body_lbl = ctk.CTkLabel(
             wrap, text=body, font=F(size=13), text_color=TEXT_DIM,
             justify="center", wraplength=420,
-        ).pack(pady=(0, 16))
+        )
+        self._body_lbl.pack(pady=(0, 16))
 
         if action:
             label, cmd = action
@@ -282,6 +344,10 @@ class EmptyState(ctk.CTkFrame):
                 fg_color=ACCENT, hover_color=ACCENT_HOV,
                 font=F(size=13, weight="bold"), corner_radius=8,
             ).pack()
+
+    def set_text(self, title: str, body: str) -> None:
+        self._title_lbl.configure(text=title)
+        self._body_lbl.configure(text=body)
 
 
 class Toast(ctk.CTkFrame):
@@ -420,6 +486,205 @@ class ConfirmDialog(ctk.CTkToplevel):
         dlg = cls(master, title, body, confirm_text, danger, require_typed)
         master.wait_window(dlg)
         return dlg._result
+
+
+class DiagnosticDialog(ctk.CTkToplevel):
+    """'Why isn't my device showing up?' — runs adb devices, fastboot devices,
+    macOS USB enumeration, and MTK preloader detection. Renders a verdict."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Connection diagnostics")
+        self.geometry("620x520")
+        self.resizable(True, True)
+        self.configure(fg_color=BG)
+        self.transient(master)
+        self.grab_set()
+
+        wrap = ctk.CTkFrame(
+            self, fg_color=SURFACE, corner_radius=12,
+            border_width=1, border_color=BORDER,
+        )
+        wrap.pack(expand=True, fill="both", padx=16, pady=16)
+        wrap.grid_columnconfigure(0, weight=1)
+        wrap.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(
+            wrap, text="Connection diagnostics",
+            font=F(size=16, weight="bold"), text_color=TEXT,
+        ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
+        self.subtitle = ctk.CTkLabel(
+            wrap, text="Scanning USB, adb, and fastboot…",
+            font=F(size=11), text_color=TEXT_DIM,
+        )
+        self.subtitle.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 12))
+
+        self.box = ctk.CTkTextbox(
+            wrap, fg_color=BG_2, text_color=TEXT,
+            font=F_MONO(size=11), corner_radius=8, wrap="word",
+        )
+        self.box.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 12))
+        self.box.configure(state="disabled")
+
+        btn_row = ctk.CTkFrame(wrap, fg_color="transparent")
+        btn_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        btn_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkButton(
+            btn_row, text="Re-run", command=self._run,
+            height=34, width=110,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT,
+            border_width=1, border_color=BORDER_2,
+            font=F(size=12), corner_radius=8,
+        ).grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(
+            btn_row, text="Copy", command=self._copy,
+            height=34, width=90,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT,
+            border_width=1, border_color=BORDER_2,
+            font=F(size=12), corner_radius=8,
+        ).grid(row=0, column=2, padx=(0, 8))
+        ctk.CTkButton(
+            btn_row, text="Close", command=self.destroy,
+            height=34, width=110,
+            fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="#fff",
+            font=F(size=12, weight="bold"), corner_radius=8,
+        ).grid(row=0, column=3)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        self._run()
+
+    def _run(self) -> None:
+        self._set_text("Running diagnostics…\n")
+        self.subtitle.configure(text="Scanning USB, adb, and fastboot…")
+
+        def work():
+            report = self._collect()
+            self.after(0, lambda: self._render(report))
+
+        _run_thread(work)
+
+    def _collect(self) -> dict:
+        out: dict = {"adb": [], "fastboot": [], "mtk": [],
+                     "adb_err": None, "fastboot_err": None}
+        try:
+            out["adb"] = adb_mod.list_devices()
+        except Exception as e:
+            out["adb_err"] = str(e)
+        try:
+            out["fastboot"] = fastboot_mod.list_devices()
+        except Exception as e:
+            out["fastboot_err"] = str(e)
+        try:
+            out["mtk"] = device_mod.detect_mtk_preloader()
+        except Exception as e:
+            out["mtk_err"] = str(e)
+        return out
+
+    def _render(self, r: dict) -> None:
+        lines: list[str] = []
+
+        # --- adb -----------------------------------------------------------
+        lines.append("adb devices")
+        lines.append("─" * 36)
+        if r["adb_err"]:
+            lines.append(f"  ERROR: {r['adb_err']}")
+        elif not r["adb"]:
+            lines.append("  (no devices)")
+        else:
+            for serial, state in r["adb"]:
+                lines.append(f"  {serial:<24} {state}")
+        lines.append("")
+
+        # --- fastboot ------------------------------------------------------
+        lines.append("fastboot devices")
+        lines.append("─" * 36)
+        if r["fastboot_err"]:
+            lines.append(f"  ERROR: {r['fastboot_err']}")
+        elif not r["fastboot"]:
+            lines.append("  (no devices)")
+        else:
+            for serial in r["fastboot"]:
+                lines.append(f"  {serial:<24} fastboot")
+        lines.append("")
+
+        # --- MTK preloader/BROM -------------------------------------------
+        lines.append("MediaTek preloader / BROM (macOS USB scan)")
+        lines.append("─" * 42)
+        if r.get("mtk_err"):
+            lines.append(f"  ERROR: {r['mtk_err']}")
+        elif not r["mtk"]:
+            lines.append("  (none detected)")
+        else:
+            for dev in r["mtk"]:
+                lines.append(f"  {dev.vid_pid}  {dev.description}")
+        lines.append("")
+
+        # --- Verdict -------------------------------------------------------
+        verdict, hint = self._verdict(r)
+        lines.append("Verdict")
+        lines.append("─" * 36)
+        lines.append(f"  {verdict}")
+        if hint:
+            lines.append("")
+            for ln in hint.splitlines():
+                lines.append(f"  {ln}")
+
+        self.subtitle.configure(text=verdict)
+        self._set_text("\n".join(lines))
+
+    def _verdict(self, r: dict) -> tuple[str, str]:
+        n_adb = len(r["adb"])
+        n_fb = len(r["fastboot"])
+        n_mtk = len(r["mtk"])
+
+        if n_adb + n_fb + n_mtk == 0:
+            return (
+                "No device visible to adb, fastboot, or USB enumeration.",
+                "Most likely cause: the phone isn't plugged in, the cable is "
+                "charge-only (no data), or the phone is powered off.\n"
+                "Try: a known-good USB-C/A data cable; a different Mac port "
+                "(USB-A direct if possible); confirm the phone is on.",
+            )
+        if n_adb == 0 and n_fb == 0 and n_mtk:
+            d = r["mtk"][0]
+            return (
+                f"Phone is in {d.description}.",
+                "Neither adb nor fastboot can talk to this mode — you need a "
+                "preloader-aware tool such as mtkclient (open source) or "
+                "SP Flash Tool. Booting out of preloader is usually:\n"
+                "  hold Power for 15s, or remove battery if possible.",
+            )
+        unauth = [s for s, st in r["adb"] if st in ("unauthorized", "offline")]
+        if unauth:
+            return (
+                f"Device is {r['adb'][0][1]}.",
+                "Unlock the phone, tap 'Allow' on the USB-debugging prompt. "
+                "If you don't see one, toggle USB debugging off/on in "
+                "Developer options, then re-run.",
+            )
+        if n_fb and not n_adb:
+            return (
+                "Device is in fastboot mode.",
+                "Use the Flash page, or click '⏻ System' in the sidebar to "
+                "reboot into Android.",
+            )
+        if n_adb:
+            states = ", ".join(f"{s} ({st})" for s, st in r["adb"])
+            return (f"adb sees: {states}", "")
+        return ("Device visible.", "")
+
+    def _set_text(self, text: str) -> None:
+        self.box.configure(state="normal")
+        self.box.delete("1.0", "end")
+        self.box.insert("1.0", text)
+        self.box.configure(state="disabled")
+
+    def _copy(self) -> None:
+        text = self.box.get("1.0", "end").strip()
+        self.clipboard_clear()
+        self.clipboard_append(text)
 
 
 class AboutDialog(ctk.CTkToplevel):
@@ -723,6 +988,12 @@ class App(ctk.CTk):
         self.views: dict[str, ctk.CTkFrame] = {}
         self.current_view = "backup"
         self._toasts: list[ctk.CTkFrame] = []
+        # Auto-poll: re-runs device discovery silently every few seconds and
+        # only re-renders when something changes. Signature = sorted tuple of
+        # (serial, state, rooted) per device.
+        self._last_device_signature: Optional[tuple] = None
+        self._auto_poll_after_id: Optional[str] = None
+        self.AUTO_POLL_INTERVAL_MS = 3500
 
         self._build_layout()
         self._bind_shortcuts()
@@ -730,13 +1001,38 @@ class App(ctk.CTk):
         self.show_view("backup")
         self._poll_signal()
         self.refresh_devices()
+        self._start_auto_poll()
 
     def _on_close(self) -> None:
         try:
+            if self._auto_poll_after_id is not None:
+                try:
+                    self.after_cancel(self._auto_poll_after_id)
+                except Exception:
+                    pass
+                self._auto_poll_after_id = None
             self.settings.window_geometry = self.geometry()
             self.settings.save()
         finally:
             self.destroy()
+
+    def _start_auto_poll(self) -> None:
+        self._auto_poll_after_id = self.after(
+            self.AUTO_POLL_INTERVAL_MS, self._auto_poll_tick)
+
+    def _auto_poll_tick(self) -> None:
+        # Silent discover — _render_device's signature check skips re-render
+        # when nothing has changed, so this is cheap when the user is mid-op.
+        def work():
+            try:
+                devs = device_mod.discover()
+                self.signal.emit({"event": "devices",
+                                  "devices": devs, "silent": True})
+            except Exception as e:
+                log.debug("auto-poll failed: %s", e)
+        _run_thread(work)
+        self._auto_poll_after_id = self.after(
+            self.AUTO_POLL_INTERVAL_MS, self._auto_poll_tick)
 
     def _bind_shortcuts(self) -> None:
         # Cmd/Ctrl+1..8 switch nav, Cmd/Ctrl+R refresh.
@@ -838,13 +1134,24 @@ class App(ctk.CTk):
         self.storage_label.grid(row=2, column=0, sticky="ew")
         self.health_frame.grid_remove()
 
+        btn_row = ctk.CTkFrame(dev_card, fg_color="transparent")
+        btn_row.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 12))
+        btn_row.grid_columnconfigure(0, weight=3)
+        btn_row.grid_columnconfigure(1, weight=2)
         ctk.CTkButton(
-            dev_card, text=f"↻  Refresh  {MOD_LABEL}R",
+            btn_row, text=f"↻  Refresh  {MOD_LABEL}R",
             command=self.refresh_devices,
             height=30, fg_color=SURFACE_2, hover_color=SURFACE_3,
             text_color=TEXT, border_width=1, border_color=BORDER_2,
             font=F(size=11), corner_radius=8,
-        ).grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 12))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            btn_row, text="Diagnose",
+            command=lambda: DiagnosticDialog(self),
+            height=30, fg_color=SURFACE_2, hover_color=SURFACE_3,
+            text_color=TEXT_DIM, border_width=1, border_color=BORDER_2,
+            font=F(size=11), corner_radius=8,
+        ).grid(row=0, column=1, sticky="ew")
 
         # Nav
         nav_label = ctk.CTkLabel(
@@ -1021,7 +1328,14 @@ class App(ctk.CTk):
 
         _run_thread(work)
 
-    def _render_device(self, devs: list[Device]) -> None:
+    def _render_device(self, devs: list[Device], silent: bool = False) -> None:
+        # Signature lets auto-poll skip re-render when nothing changed —
+        # otherwise we'd re-enumerate partitions every poll tick.
+        sig = tuple(sorted((d.serial, d.state, d.rooted) for d in devs))
+        if silent and sig == self._last_device_signature:
+            return
+        self._last_device_signature = sig
+
         self.all_devices = devs
         if not devs:
             self.current_device = None
@@ -1030,7 +1344,8 @@ class App(ctk.CTk):
             self.device_info_label.configure(
                 text="No device connected.\nPlug in a phone via USB.")
             self.device_selector.grid_remove()
-            self.status("No devices attached.", "idle")
+            if not silent:
+                self.status("No devices attached.", "idle")
             self.partitions = []
             self._refresh_views()  # single call only — was duplicated before
             return
@@ -1181,11 +1496,26 @@ class App(ctk.CTk):
         if not self.current_device:
             self.toast("No device selected.", "warn")
             return
+        d = self.current_device
         target_arg = None if target == "system" else target
         try:
-            adb_mod.reboot(target_arg, serial=self.current_device.serial)
+            if d.state == "fastboot":
+                # fastboot can't reboot directly into sideload.
+                if target == "sideload":
+                    raise RuntimeError(
+                        "Sideload isn't reachable from fastboot. "
+                        "Reboot to recovery first, then enter sideload from there."
+                    )
+                fastboot_mod.reboot(target_arg, serial=d.serial)
+            elif d.state in ("device", "recovery", "sideload"):
+                adb_mod.reboot(target_arg, serial=d.serial)
+            else:
+                raise RuntimeError(
+                    f"Cannot reboot: device is {d.state!r}. "
+                    "Accept the USB-debug prompt on the phone, or replug it."
+                )
             self.toast(f"Rebooting to {target}…", "info")
-            self.log(f"[reboot] {self.current_device.serial} -> {target}")
+            self.log(f"[reboot] {d.serial} ({d.state}) -> {target}")
             self.status(f"Reboot to {target} issued.", "ok")
         except Exception as e:
             self.toast(f"Reboot failed: {e}", "err")
@@ -1209,7 +1539,7 @@ class App(ctk.CTk):
     def _handle_event(self, ev: dict) -> None:
         kind = ev.get("event")
         if kind == "devices":
-            self._render_device(ev["devices"])
+            self._render_device(ev["devices"], silent=ev.get("silent", False))
         elif kind == "partitions":
             self.partitions = ev["partitions"]
             self.status(f"{len(ev['partitions'])} partitions enumerated.", "ok")
@@ -1582,8 +1912,12 @@ class BackupView(ctk.CTkFrame):
             self.parts_scroll.grid_remove()
             self.empty_parts.grid(row=0, column=0, sticky="nsew")
             self.parts_count.configure(text="")
-            self.selection_label.configure(
-                text="Connect a device to begin.", text_color=TEXT_MUTED)
+            title, body, hint = device_unavailable_copy(
+                self.app.current_device, "enumerate partitions",
+                requires_root=True,
+            )
+            self.empty_parts.set_text(title, body)
+            self.selection_label.configure(text=hint, text_color=TEXT_MUTED)
             self.start_btn.configure(state="disabled")
             return
 
@@ -2908,13 +3242,15 @@ class AppsView(ctk.CTkFrame):
             self._show_empty()
             self._packages = []
             self._rows.clear()
-            self.action_hint.configure(
-                text="Connect a device in adb mode to list apps.",
-                text_color=TEXT_DIM)
+            title, body, hint = device_unavailable_copy(d, "list installed apps")
+            self.empty_state.set_text(title, body)
+            self.action_hint.configure(text=hint, text_color=TEXT_DIM)
             self.pull_btn.configure(state="disabled")
             return
 
     def on_show(self) -> None:
+        # Refresh the empty-state copy for whatever mode the device is in.
+        self.on_device_changed()
         if not self._packages and self.app.current_device \
                 and self.app.current_device.state == "device":
             self._reload()
@@ -3445,6 +3781,8 @@ class PropertiesView(ctk.CTkFrame):
             self.scroll.grid_remove()
             self.empty.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
             self.count_label.configure(text="")
+            title, body, _ = device_unavailable_copy(d, "browse system properties")
+            self.empty.set_text(title, body)
             return
 
         self.empty.grid_remove()

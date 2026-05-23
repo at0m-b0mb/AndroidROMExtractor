@@ -10,6 +10,7 @@ import click
 from rich.table import Table
 
 from . import __version__, adb, backup as backup_mod, device as device_mod
+from . import fastboot
 from . import flash as flash_mod
 from . import partitions as part_mod
 from . import verify as verify_mod
@@ -296,10 +297,35 @@ def restore(backup_dir: Path, only: Optional[str], skip: Optional[str],
 
 @main.command(help="Reboot device to a given target.")
 @click.argument("target", type=click.Choice(["system", "bootloader", "recovery",
-                                             "sideload"]))
+                                             "sideload", "fastboot"]))
 @click.option("--serial", "-s")
 def reboot(target: str, serial: Optional[str]) -> None:
-    adb.reboot(None if target == "system" else target, serial=serial)
+    """Dispatch by current device state: fastboot binary for fastboot mode,
+    adb binary otherwise. Fails clearly when the requested target isn't
+    reachable from the current state."""
+    dev = _pick_device(serial)
+    target_arg = None if target == "system" else target
+
+    if dev.state == "fastboot":
+        if target == "sideload":
+            console.print(
+                "[red]Sideload isn't reachable from fastboot.[/red] "
+                "Reboot to recovery first, then enter sideload from there."
+            )
+            sys.exit(1)
+        fastboot.reboot(target_arg, serial=dev.serial)
+    elif dev.state in ("device", "recovery", "sideload"):
+        if target == "fastboot":
+            # adb has no `reboot fastboot` target — use bootloader.
+            target_arg = "bootloader"
+        adb.reboot(target_arg, serial=dev.serial)
+    else:
+        console.print(
+            f"[red]Cannot reboot:[/red] device is {dev.state!r}. "
+            "Accept the USB-debug prompt on the phone, or replug it."
+        )
+        sys.exit(1)
+
     console.print(f"[green]Reboot to {target} issued.[/green]")
 
 

@@ -74,5 +74,11 @@ def boot(image: Path, serial: Optional[str] = None) -> None:
     run(["boot", str(image)], serial=serial, capture=False)
 
 
-def reboot(serial: Optional[str] = None) -> None:
-    run(["reboot"], serial=serial, capture=False)
+def reboot(target: Optional[str] = None, serial: Optional[str] = None) -> None:
+    """Reboot from fastboot. `target` can be None (=system), 'bootloader',
+    'fastboot' (fastbootd), or 'recovery'. Sideload is not reachable from
+    fastboot directly — boot to recovery first."""
+    args = ["reboot"]
+    if target:
+        args.append(target)
+    run(args, serial=serial, capture=False)
