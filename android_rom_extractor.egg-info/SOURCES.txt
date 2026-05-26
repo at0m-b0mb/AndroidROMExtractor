@@ -9,6 +9,7 @@ android_rom_extractor.egg-info/top_level.txt
 rom_extractor/__init__.py
 rom_extractor/__main__.py
 rom_extractor/adb.py
+rom_extractor/apps.py
 rom_extractor/backup.py
 rom_extractor/cli.py
 rom_extractor/device.py

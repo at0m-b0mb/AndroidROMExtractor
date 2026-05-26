@@ -88,3 +88,52 @@ def reboot(target: Optional[str] = None, serial: Optional[str] = None) -> None:
 
 def sideload(zip_path: Path, serial: Optional[str] = None) -> None:
     run(["sideload", str(zip_path)], serial=serial, capture=False)
+
+
+# --- Wireless ADB ------------------------------------------------------------
+# Android 11+ requires `adb pair host:pairing_port` with a 6-digit code once
+# per host, after which `adb connect host:5555` works. On Android 10 and older
+# you USB-attach first, run `adb tcpip 5555`, then `adb connect host:5555`.
+
+def connect(host: str, port: int = 5555) -> str:
+    """Connect to a device by IP. Returns adb's status line."""
+    proc = run(["connect", f"{host}:{port}"], check=False, timeout=8)
+    out = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0 or "failed" in out.lower() or "cannot" in out.lower():
+        raise CommandError(["connect", f"{host}:{port}"], proc.returncode, out)
+    return out
+
+
+def disconnect(host: Optional[str] = None, port: int = 5555) -> str:
+    """Disconnect a wireless device. Pass None to disconnect all."""
+    args = ["disconnect"]
+    if host:
+        args.append(f"{host}:{port}")
+    proc = run(args, check=False, timeout=8)
+    return (proc.stdout or proc.stderr or "").strip()
+
+
+def pair(host: str, port: int, code: str) -> str:
+    """Pair (Android 11+). Code is the 6-digit pairing code shown on-device.
+    Pairing port is NOT the connection port — it's the random one shown under
+    'Pair device with pairing code' in Wireless debugging settings."""
+    if not code.isdigit() or len(code) != 6:
+        raise ValueError("Pairing code must be exactly 6 digits.")
+    # adb pair reads the code from stdin.
+    cmd = [_adb_binary(), "pair", f"{host}:{port}"]
+    proc = subprocess.run(
+        cmd, input=code + "\n", capture_output=True, text=True, timeout=15)
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0 or "failed" in out.lower() or "failed" in err.lower():
+        raise CommandError(cmd, proc.returncode, err or out)
+    return out
+
+
+def tcpip(port: int = 5555, serial: Optional[str] = None) -> str:
+    """Restart adbd on the device in TCP/IP mode on `port` (Android <=10 flow)."""
+    proc = run(["tcpip", str(port)], serial=serial, check=False, timeout=8)
+    out = (proc.stdout or proc.stderr or "").strip()
+    if proc.returncode != 0:
+        raise CommandError(["tcpip", str(port)], proc.returncode, out)
+    return out

@@ -24,6 +24,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 from . import __version__, adb as adb_mod, apps as apps_mod, backup as backup_mod
+from . import boot_analyze
 from . import device as device_mod, fastboot as fastboot_mod, flash as flash_mod
 from . import partitions as part_mod
 from . import settings as settings_mod
@@ -32,7 +33,7 @@ from .device import Device
 from .manifest import Manifest, MANIFEST_FILENAME
 from .partitions import (DEFAULT_BACKUP_SET, MTK_CRITICAL, Partition,
                          is_dangerous)
-from .utils import human_size, sha256_file
+from .utils import human_size, notify, sha256_file
 
 IS_MAC = platform.system() == "Darwin"
 MOD_KEY = "Command" if IS_MAC else "Control"
@@ -74,6 +75,12 @@ DANGER_HOV  = "#dc2626"
 DANGER_DIM  = "#7f1d1d"
 INFO        = "#06b6d4"
 MTK         = "#a78bfa"   # violet
+
+def _isoformat_now() -> str:
+    """UTC timestamp as ISO-8601 — used for export payloads."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
 
 def device_unavailable_copy(d: Optional[Device], purpose: str,
                             requires_root: bool = False
@@ -486,6 +493,405 @@ class ConfirmDialog(ctk.CTkToplevel):
         dlg = cls(master, title, body, confirm_text, danger, require_typed)
         master.wait_window(dlg)
         return dlg._result
+
+
+class FastbootToolsDialog(ctk.CTkToplevel):
+    """Wipe partitions + unlock/lock bootloader. Only meaningful when the
+    device is in fastboot mode; if it isn't, the dialog shows a hint."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.app = master
+        self.title("Fastboot tools")
+        self.geometry("560x520")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.transient(master)
+        self.grab_set()
+
+        wrap = ctk.CTkFrame(
+            self, fg_color=SURFACE, corner_radius=12,
+            border_width=1, border_color=BORDER,
+        )
+        wrap.pack(expand=True, fill="both", padx=16, pady=16)
+        wrap.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            wrap, text="Fastboot tools",
+            font=F(size=16, weight="bold"), text_color=TEXT,
+        ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 4))
+
+        d = self.app.current_device
+        in_fastboot = d is not None and d.state == "fastboot"
+        sub = ("Device is in fastboot mode — commands will run on it."
+               if in_fastboot else
+               "⚠ Device is NOT in fastboot mode. These commands will fail "
+               "until you reboot to bootloader (Power section in the sidebar).")
+        ctk.CTkLabel(
+            wrap, text=sub, font=F(size=11),
+            text_color=SUCCESS if in_fastboot else WARN,
+            anchor="w", justify="left", wraplength=480,
+        ).grid(row=1, column=0, sticky="w", padx=20, pady=(0, 14))
+
+        # --- Erase partition ----------------------------------------------
+        ctk.CTkLabel(
+            wrap, text="Erase partition",
+            font=F(size=12, weight="bold"), text_color=TEXT, anchor="w",
+        ).grid(row=2, column=0, sticky="w", padx=20, pady=(0, 4))
+        ctk.CTkLabel(
+            wrap,
+            text="Wipes a partition with `fastboot erase`. Common targets: "
+                 "cache, userdata, metadata. Will not erase dynamic-partition "
+                 "members (system/vendor/product) on Android 10+.",
+            font=F(size=10), text_color=TEXT_MUTED,
+            anchor="w", justify="left", wraplength=480,
+        ).grid(row=3, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        row_e = ctk.CTkFrame(wrap, fg_color="transparent")
+        row_e.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 14))
+        row_e.grid_columnconfigure(0, weight=1)
+        self.erase_entry = ctk.CTkEntry(
+            row_e, height=34, fg_color=BG_2, border_color=BORDER_2,
+            text_color=TEXT, font=F_MONO(size=12),
+            placeholder_text="partition name (e.g. cache)",
+        )
+        self.erase_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            row_e, text="Erase", command=self._do_erase,
+            height=34, width=110,
+            fg_color=SURFACE_2, hover_color=DANGER_DIM, text_color=DANGER,
+            border_width=1, border_color=DANGER_DIM,
+            font=F(size=12, weight="bold"), corner_radius=8,
+        ).grid(row=0, column=1, sticky="e")
+
+        # --- Unlock / lock ------------------------------------------------
+        ctk.CTkLabel(
+            wrap, text="Bootloader lock",
+            font=F(size=12, weight="bold"), text_color=TEXT, anchor="w",
+        ).grid(row=5, column=0, sticky="w", padx=20, pady=(0, 4))
+        ctk.CTkLabel(
+            wrap,
+            text="Unlock factory-resets the device on most phones and the "
+                 "user must confirm on the phone screen. Uses the modern "
+                 "`fastboot flashing unlock` command; older devices may need "
+                 "`fastboot oem unlock` (the OEM button below).",
+            font=F(size=10), text_color=TEXT_MUTED,
+            anchor="w", justify="left", wraplength=480,
+        ).grid(row=6, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        row_l = ctk.CTkFrame(wrap, fg_color="transparent")
+        row_l.grid(row=7, column=0, sticky="ew", padx=20, pady=(0, 14))
+        row_l.grid_columnconfigure(0, weight=1)
+        row_l.grid_columnconfigure(1, weight=1)
+        row_l.grid_columnconfigure(2, weight=1)
+        ctk.CTkButton(
+            row_l, text="flashing unlock",
+            command=lambda: self._do_flashing("unlock"),
+            height=34, fg_color=SURFACE_2, hover_color=DANGER_DIM,
+            text_color=DANGER, border_width=1, border_color=DANGER_DIM,
+            font=F(size=12, weight="bold"), corner_radius=8,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(
+            row_l, text="flashing lock",
+            command=lambda: self._do_flashing("lock"),
+            height=34, fg_color=SURFACE_2, hover_color=SURFACE_3,
+            text_color=TEXT_DIM, border_width=1, border_color=BORDER_2,
+            font=F(size=12), corner_radius=8,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
+        ctk.CTkButton(
+            row_l, text="oem unlock (legacy)",
+            command=lambda: self._do_oem("unlock"),
+            height=34, fg_color=SURFACE_2, hover_color=SURFACE_3,
+            text_color=TEXT_DIM, border_width=1, border_color=BORDER_2,
+            font=F(size=12), corner_radius=8,
+        ).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        # --- Output -------------------------------------------------------
+        ctk.CTkLabel(
+            wrap, text="Output",
+            font=F(size=11, weight="bold"), text_color=TEXT_DIM, anchor="w",
+        ).grid(row=8, column=0, sticky="w", padx=20, pady=(0, 4))
+        self.output = ctk.CTkTextbox(
+            wrap, fg_color=BG_2, text_color=TEXT_DIM,
+            font=F_MONO(size=11), corner_radius=8, height=120, wrap="word",
+        )
+        self.output.grid(row=9, column=0, sticky="ew", padx=20, pady=(0, 14))
+        self.output.configure(state="disabled")
+
+        ctk.CTkButton(
+            wrap, text="Close", command=self.destroy,
+            height=30, width=110,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
+            border_width=1, border_color=BORDER_2,
+            font=F(size=11), corner_radius=8,
+        ).grid(row=10, column=0, sticky="e", padx=20, pady=(0, 18))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _serial(self) -> Optional[str]:
+        return (self.app.current_device.serial
+                if self.app.current_device else None)
+
+    def _log(self, text: str) -> None:
+        self.output.configure(state="normal")
+        self.output.insert("end", text + "\n")
+        self.output.see("end")
+        self.output.configure(state="disabled")
+
+    def _do_erase(self) -> None:
+        part = self.erase_entry.get().strip()
+        if not part:
+            self._log("Enter a partition name.")
+            return
+        if not ConfirmDialog.ask(
+            self.app, title=f"Erase {part}?",
+            body=f"`fastboot erase {part}` will wipe the partition. "
+                 f"This is destructive and not always reversible. Continue?",
+            confirm_text=f"Erase {part}", danger=True, require_typed=part,
+        ):
+            return
+        self._log(f"$ fastboot erase {part}")
+        def work():
+            try:
+                out = fastboot_mod.erase(part, serial=self._serial())
+                self.after(0, lambda: self._log(out.strip() or "(ok)"))
+            except Exception as e:
+                self.after(0, lambda: self._log(f"ERROR: {e}"))
+        _run_thread(work)
+
+    def _do_flashing(self, action: str) -> None:
+        if action == "unlock":
+            if not ConfirmDialog.ask(
+                self.app, title="Unlock bootloader?",
+                body="`fastboot flashing unlock` factory-resets the device on "
+                     "most phones (all user data wiped) and must be confirmed "
+                     "on the phone screen. The device shows a 'bootloader "
+                     "unlocked' warning on every subsequent boot. Continue?",
+                confirm_text="Unlock", danger=True, require_typed="UNLOCK",
+            ):
+                return
+        self._log(f"$ fastboot flashing {action}")
+        def work():
+            try:
+                out = fastboot_mod.flashing(action, serial=self._serial())
+                self.after(0, lambda: self._log(out.strip() or "(ok)"))
+            except Exception as e:
+                self.after(0, lambda: self._log(f"ERROR: {e}"))
+        _run_thread(work)
+
+    def _do_oem(self, action: str) -> None:
+        if not ConfirmDialog.ask(
+            self.app, title=f"fastboot oem {action}?",
+            body=f"This sends `fastboot oem {action}` — behavior is "
+                 f"device-specific. On older devices this is the unlock "
+                 f"command; on others it's a no-op or returns an error. "
+                 f"Continue?",
+            confirm_text="Send", danger=True,
+        ):
+            return
+        self._log(f"$ fastboot oem {action}")
+        def work():
+            try:
+                out = fastboot_mod.oem(action, serial=self._serial())
+                self.after(0, lambda: self._log(out.strip() or "(ok)"))
+            except Exception as e:
+                self.after(0, lambda: self._log(f"ERROR: {e}"))
+        _run_thread(work)
+
+
+class WirelessAdbDialog(ctk.CTkToplevel):
+    """Pair + connect to a device over WiFi. Two-step UI for Android 11+:
+    pair once (6-digit code), then connect (port 5555 by default)."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.app = master
+        self.title("Wireless ADB")
+        self.geometry("500x460")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.transient(master)
+        self.grab_set()
+
+        wrap = ctk.CTkFrame(
+            self, fg_color=SURFACE, corner_radius=12,
+            border_width=1, border_color=BORDER,
+        )
+        wrap.pack(expand=True, fill="both", padx=16, pady=16)
+        wrap.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            wrap, text="Wireless ADB",
+            font=F(size=16, weight="bold"), text_color=TEXT,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(18, 4))
+        ctk.CTkLabel(
+            wrap, text="On the phone: Developer options → Wireless debugging.",
+            font=F(size=11), text_color=TEXT_DIM, anchor="w",
+            justify="left", wraplength=440,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 14))
+
+        # --- Pair (Android 11+) -------------------------------------------
+        ctk.CTkLabel(
+            wrap, text="1. Pair (Android 11+, one-time)",
+            font=F(size=12, weight="bold"), text_color=TEXT,
+            anchor="w",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 4))
+        ctk.CTkLabel(
+            wrap, text="On phone: 'Pair device with pairing code'. "
+                       "Enter the IP, the pairing port, and the 6-digit code.",
+            font=F(size=10), text_color=TEXT_MUTED, anchor="w",
+            justify="left", wraplength=440,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 8))
+
+        row_p = ctk.CTkFrame(wrap, fg_color="transparent")
+        row_p.grid(row=4, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 4))
+        row_p.grid_columnconfigure(0, weight=2)
+        row_p.grid_columnconfigure(1, weight=1)
+        row_p.grid_columnconfigure(2, weight=1)
+        self.pair_ip = self._entry(row_p, "192.168.1.42")
+        self.pair_ip.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.pair_port = self._entry(row_p, "37099")
+        self.pair_port.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.pair_code = self._entry(row_p, "123456")
+        self.pair_code.grid(row=0, column=2, sticky="ew")
+
+        self.pair_btn = ctk.CTkButton(
+            wrap, text="Pair", command=self._do_pair,
+            height=32, fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT,
+            border_width=1, border_color=BORDER_2, font=F(size=12),
+            corner_radius=8,
+        )
+        self.pair_btn.grid(row=5, column=0, columnspan=2, sticky="ew",
+                           padx=20, pady=(4, 14))
+
+        # --- Connect ------------------------------------------------------
+        ctk.CTkLabel(
+            wrap, text="2. Connect",
+            font=F(size=12, weight="bold"), text_color=TEXT,
+            anchor="w",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 4))
+        ctk.CTkLabel(
+            wrap, text="Use the IP + port shown in the Wireless debugging "
+                       "screen (the larger numbers — usually port 5555).",
+            font=F(size=10), text_color=TEXT_MUTED, anchor="w",
+            justify="left", wraplength=440,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 8))
+
+        row_c = ctk.CTkFrame(wrap, fg_color="transparent")
+        row_c.grid(row=8, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 4))
+        row_c.grid_columnconfigure(0, weight=2)
+        row_c.grid_columnconfigure(1, weight=1)
+        self.conn_ip = self._entry(row_c, "192.168.1.42")
+        self.conn_ip.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.conn_port = self._entry(row_c, "5555")
+        self.conn_port.grid(row=0, column=1, sticky="ew")
+
+        self.conn_btn = ctk.CTkButton(
+            wrap, text="Connect", command=self._do_connect,
+            height=32, fg_color=ACCENT, hover_color=ACCENT_HOV, text_color="#fff",
+            font=F(size=12, weight="bold"), corner_radius=8,
+        )
+        self.conn_btn.grid(row=9, column=0, columnspan=2, sticky="ew",
+                           padx=20, pady=(4, 14))
+
+        # --- Result ------------------------------------------------------
+        self.result_lbl = ctk.CTkLabel(
+            wrap, text="", font=F(size=11), text_color=TEXT_MUTED,
+            anchor="w", justify="left", wraplength=440,
+        )
+        self.result_lbl.grid(row=10, column=0, columnspan=2, sticky="ew",
+                             padx=20, pady=(0, 14))
+
+        # --- Footer ------------------------------------------------------
+        ctk.CTkButton(
+            wrap, text="Close", command=self.destroy,
+            height=30, width=110,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
+            border_width=1, border_color=BORDER_2,
+            font=F(size=11), corner_radius=8,
+        ).grid(row=11, column=1, sticky="e", padx=20, pady=(0, 18))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _entry(self, parent, placeholder: str) -> ctk.CTkEntry:
+        return ctk.CTkEntry(
+            parent, height=34, fg_color=BG_2, border_color=BORDER_2,
+            text_color=TEXT, font=F_MONO(size=12), placeholder_text=placeholder,
+        )
+
+    def _set_result(self, text: str, kind: str = "info") -> None:
+        color = {"ok": SUCCESS, "err": DANGER, "busy": ACCENT_GLOW}.get(
+            kind, TEXT_MUTED)
+        self.result_lbl.configure(text=text, text_color=color)
+
+    def _do_pair(self) -> None:
+        ip = self.pair_ip.get().strip()
+        port_s = self.pair_port.get().strip()
+        code = self.pair_code.get().strip()
+        if not ip or not port_s or not code:
+            self._set_result("Enter IP, pairing port, and 6-digit code.", "err")
+            return
+        try:
+            port = int(port_s)
+        except ValueError:
+            self._set_result("Pairing port must be a number.", "err")
+            return
+        if not code.isdigit() or len(code) != 6:
+            self._set_result("Pairing code must be exactly 6 digits.", "err")
+            return
+        self.pair_btn.configure(state="disabled", text="Pairing…")
+        self._set_result(f"Pairing with {ip}:{port}…", "busy")
+
+        def work():
+            try:
+                msg = adb_mod.pair(ip, port, code)
+                self.after(0, lambda: self._pair_done(True, msg, ip))
+            except Exception as e:
+                self.after(0, lambda: self._pair_done(False, str(e), ip))
+        _run_thread(work)
+
+    def _pair_done(self, ok: bool, msg: str, ip: str) -> None:
+        self.pair_btn.configure(state="normal", text="Pair")
+        if ok:
+            self._set_result(f"Paired with {ip}. Now click Connect.", "ok")
+            # Auto-fill connect IP from pair IP.
+            if not self.conn_ip.get().strip():
+                self.conn_ip.delete(0, "end"); self.conn_ip.insert(0, ip)
+        else:
+            self._set_result(f"Pair failed: {msg}", "err")
+
+    def _do_connect(self) -> None:
+        ip = self.conn_ip.get().strip()
+        port_s = self.conn_port.get().strip() or "5555"
+        if not ip:
+            self._set_result("Enter the device IP.", "err")
+            return
+        try:
+            port = int(port_s)
+        except ValueError:
+            self._set_result("Connection port must be a number.", "err")
+            return
+        self.conn_btn.configure(state="disabled", text="Connecting…")
+        self._set_result(f"Connecting to {ip}:{port}…", "busy")
+
+        def work():
+            try:
+                msg = adb_mod.connect(ip, port)
+                self.after(0, lambda: self._connect_done(True, msg))
+            except Exception as e:
+                self.after(0, lambda: self._connect_done(False, str(e)))
+        _run_thread(work)
+
+    def _connect_done(self, ok: bool, msg: str) -> None:
+        self.conn_btn.configure(state="normal", text="Connect")
+        if ok:
+            self._set_result(f"Connected. {msg}", "ok")
+            # Kick a refresh so the new device shows in the sidebar.
+            self.app.refresh_devices()
+        else:
+            self._set_result(f"Connect failed: {msg}", "err")
 
 
 class DiagnosticDialog(ctk.CTkToplevel):
@@ -981,8 +1387,11 @@ class App(ctk.CTk):
         self.configure(fg_color=BG)
 
         self.current_device: Optional[Device] = None
+        self._last_selected_serial: Optional[str] = None
         self.all_devices: list[Device] = []
+        self.current_health: Optional[device_mod.DeviceHealth] = None
         self.partitions: list[Partition] = []
+        self.BATTERY_DESTRUCTIVE_THRESHOLD = 15  # percent
         self.signal = WorkerSignal()
         self.nav_buttons: dict[str, NavButton] = {}
         self.views: dict[str, ctk.CTkFrame] = {}
@@ -1136,22 +1545,29 @@ class App(ctk.CTk):
 
         btn_row = ctk.CTkFrame(dev_card, fg_color="transparent")
         btn_row.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 12))
-        btn_row.grid_columnconfigure(0, weight=3)
-        btn_row.grid_columnconfigure(1, weight=2)
+        btn_row.grid_columnconfigure(0, weight=1)
+        btn_row.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(
             btn_row, text=f"↻  Refresh  {MOD_LABEL}R",
             command=self.refresh_devices,
             height=30, fg_color=SURFACE_2, hover_color=SURFACE_3,
             text_color=TEXT, border_width=1, border_color=BORDER_2,
             font=F(size=11), corner_radius=8,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         ctk.CTkButton(
             btn_row, text="Diagnose",
             command=lambda: DiagnosticDialog(self),
-            height=30, fg_color=SURFACE_2, hover_color=SURFACE_3,
+            height=28, fg_color=SURFACE_2, hover_color=SURFACE_3,
             text_color=TEXT_DIM, border_width=1, border_color=BORDER_2,
             font=F(size=11), corner_radius=8,
-        ).grid(row=0, column=1, sticky="ew")
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 3))
+        ctk.CTkButton(
+            btn_row, text="WiFi ADB",
+            command=lambda: WirelessAdbDialog(self),
+            height=28, fg_color=SURFACE_2, hover_color=SURFACE_3,
+            text_color=TEXT_DIM, border_width=1, border_color=BORDER_2,
+            font=F(size=11), corner_radius=8,
+        ).grid(row=1, column=1, sticky="ew", padx=(3, 0))
 
         # Nav
         nav_label = ctk.CTkLabel(
@@ -1189,6 +1605,16 @@ class App(ctk.CTk):
                 border_width=0, corner_radius=8,
                 command=lambda t=target: self.reboot(t),
             ).grid(row=i, column=0, sticky="ew", pady=2, padx=2)
+
+        # Fastboot tools (erase, flashing unlock/lock) live one click below
+        # the reboot buttons since they need the same fastboot session.
+        ctk.CTkButton(
+            power_wrap, text="⚙   Fastboot tools…", height=32,
+            fg_color="transparent", hover_color=SURFACE_2, anchor="w",
+            text_color=WARN, font=F(size=12),
+            border_width=0, corner_radius=8,
+            command=lambda: FastbootToolsDialog(self),
+        ).grid(row=4, column=0, sticky="ew", pady=(8, 2), padx=2)
 
         # Footer
         footer = ctk.CTkFrame(side, fg_color="transparent")
@@ -1339,6 +1765,7 @@ class App(ctk.CTk):
         self.all_devices = devs
         if not devs:
             self.current_device = None
+            self.current_health = None
             self.status_pill.set("idle")
             self.status_pill.set_text("Disconnected")
             self.device_info_label.configure(
@@ -1363,12 +1790,22 @@ class App(ctk.CTk):
             labels = [self._device_label(d) for d in devs_sorted]
             self._device_map = dict(zip(labels, devs_sorted))
             self.device_selector.configure(values=labels)
-            self.device_selector.set(labels[0])
             self.device_selector.grid()
         else:
             self.device_selector.grid_remove()
 
-        self._select_device(devs_sorted[0])
+        # Auto-reconnect: if the previously-selected serial is still attached
+        # (possibly in a different mode after a reboot), re-select it instead
+        # of the sort-default. Keeps the user's choice stable across
+        # fastboot <-> adb transitions.
+        prev_serial = getattr(self, "_last_selected_serial", None)
+        pick = next(
+            (d for d in devs_sorted if d.serial == prev_serial),
+            devs_sorted[0],
+        )
+        if len(devs) > 1:
+            self.device_selector.set(self._device_label(pick))
+        self._select_device(pick)
 
     def _device_label(self, d: Device) -> str:
         name = d.model if d.model and d.model != "unknown" else d.serial
@@ -1382,6 +1819,7 @@ class App(ctk.CTk):
 
     def _select_device(self, d: Device) -> None:
         self.current_device = d
+        self._last_selected_serial = d.serial  # for auto-reconnect across reboots
 
         state_kind = "ok" if d.state == "device" and d.rooted else "warn"
         if d.state in ("offline", "unauthorized"):
@@ -1424,6 +1862,34 @@ class App(ctk.CTk):
             self.partitions = []
             self._refresh_views()
 
+    def confirm_battery_ok(self, op_name: str) -> bool:
+        """Pre-flight check before destructive operations.
+
+        Returns True if it's safe to proceed (battery unknown, or above
+        threshold, or user accepted the warning); False if the user cancels.
+        If battery info isn't available (fastboot mode, unrooted recovery,
+        etc.) we don't block — there's no way to know."""
+        h = self.current_health
+        if h is None or h.battery_level is None:
+            return True
+        if h.battery_level >= self.BATTERY_DESTRUCTIVE_THRESHOLD:
+            return True
+        charging = (h.battery_status or "").lower() in ("charging", "full")
+        body = (
+            f"Battery is at {h.battery_level}%"
+            + (" (charging)" if charging else "")
+            + f", below the {self.BATTERY_DESTRUCTIVE_THRESHOLD}% pre-flight "
+              f"threshold. If the phone dies mid-{op_name}, the partition can "
+              f"be left in an unbootable state — recovery from that usually "
+              f"needs SP Flash Tool or mtkclient.\n\n"
+              f"Recommendation: plug into a wall charger and wait a few "
+              f"minutes."
+        )
+        return ConfirmDialog.ask(
+            self, title=f"Low battery — {op_name}?", body=body,
+            confirm_text=f"{op_name.capitalize()} anyway", danger=True,
+        )
+
     def _query_health(self, serial: str) -> None:
         signal = self.signal
 
@@ -1437,6 +1903,8 @@ class App(ctk.CTk):
         _run_thread(work)
 
     def _render_health(self, health: "device_mod.DeviceHealth") -> None:
+        # Cache for pre-flight checks before destructive ops.
+        self.current_health = health
         # Bail if user has switched devices since query started.
         parts: list[str] = []
         if health.battery_level is not None:
@@ -1610,7 +2078,18 @@ class BackupView(ctk.CTkFrame):
             out_card, text="Auto-verify backup when complete",
             variable=self.auto_verify, progress_color=SUCCESS,
             font=F(size=12), text_color=TEXT_DIM,
-        ).grid(row=2, column=0, columnspan=3, padx=20, pady=(0, 16), sticky="w")
+        ).grid(row=2, column=0, columnspan=3, padx=20, pady=(0, 4), sticky="w")
+
+        # gzip toggle — host-side compression, ~50% smaller backups, hashes
+        # still cross-check against on-device sha256sum because we hash the
+        # uncompressed bytes.
+        self.compress_var = tk.BooleanVar(
+            value=getattr(self.app.settings, "compress_backups", False))
+        ctk.CTkSwitch(
+            out_card, text="Compress with gzip (smaller backups, slightly slower)",
+            variable=self.compress_var, progress_color=ACCENT,
+            font=F(size=12), text_color=TEXT_DIM,
+        ).grid(row=3, column=0, columnspan=3, padx=20, pady=(0, 16), sticky="w")
 
         # Partitions card
         parts_card = Card(self)
@@ -2044,6 +2523,8 @@ class BackupView(ctk.CTkFrame):
         self.app.settings.last_output_dir = str(out_dir)
         self.app.settings.default_partition_selection = [p.name for p in sel]
         self.app.settings.auto_verify_after_backup = self.auto_verify.get()
+        if hasattr(self.app.settings, "compress_backups"):
+            self.app.settings.compress_backups = bool(self.compress_var.get())
         self.app.settings.save()
 
         self._running = True
@@ -2080,12 +2561,14 @@ class BackupView(ctk.CTkFrame):
                 signal.emit({"event": f"_backup_{ev['type']}", **ev,
                              "expected": per_part_total.get(ev.get("name"), 0)})
 
+        compress = bool(self.compress_var.get())
+
         def work():
             try:
                 entries = backup_mod.backup_partitions(
                     device=device, parts=sel, out_dir=out_dir,
                     verify_on_device=True, events=emit,
-                    cancel=cancel_event,
+                    cancel=cancel_event, compress=compress,
                 )
                 if not entries:
                     # Cancelled before any entry was completed.
@@ -2160,6 +2643,8 @@ class BackupView(ctk.CTkFrame):
                          f"— {ev['count']} partitions in {ev['out']}")
             self.app.toast(msg, kind_)
             self.app.status(msg, kind_)
+            # Native notification — backups can take 10+ min, user has moved on.
+            notify("ROM Extractor — Backup", msg, sound=not cancelled)
             self.progress_title.configure(
                 text="Backup cancelled" if cancelled else "Backup complete")
             self.progress_pct.configure(text=f"{int(self.progress_bar.get()*100)}%"
@@ -2326,8 +2811,16 @@ class FlashView(ctk.CTkFrame):
         def work():
             try:
                 sha = sha256_file(Path(p))
+                # Also run a cheap boot-image analysis. Skips for files that
+                # aren't Android boot/recovery — output reflects that.
+                info = None
+                try:
+                    info = boot_analyze.analyze(Path(p))
+                except Exception:
+                    pass
                 signal.emit({"event": "_flash_hash", "file": p,
-                             "size": size, "sha": sha})
+                             "size": size, "sha": sha,
+                             "boot_info": info})
             except Exception as e:
                 signal.emit({"event": "_flash_hash_err", "error": str(e)})
 
@@ -2372,6 +2865,10 @@ class FlashView(ctk.CTkFrame):
         if not ok:
             return
 
+        # Battery pre-flight (only matters for actual flash, not test boot).
+        if not boot_only and not self.app.confirm_battery_ok("flash"):
+            return
+
         serial = self.app.current_device.serial if self.app.current_device else None
         self.flash_btn.configure(state="disabled", text="Flashing…")
         self.app.status(f"{'Booting' if boot_only else 'Flashing'} {partition}…", "busy")
@@ -2403,6 +2900,7 @@ class FlashView(ctk.CTkFrame):
             self.output.insert("end", "\n" + msg + "\n")
             self.app.toast(msg, "ok")
             self.app.status(msg, "ok")
+            notify("ROM Extractor — Flash", msg, sound=True)
         elif kind == "_flash_finished":
             self.flash_btn.configure(state="normal", text="Flash image")
         elif kind == "_flash_hash":
@@ -2414,6 +2912,19 @@ class FlashView(ctk.CTkFrame):
                     f"size:     {human_size(ev['size'])}\n"
                     f"sha256:   {ev['sha']}\n"
                 )
+                info = ev.get("boot_info")
+                if info is not None:
+                    self.output.insert("end", f"boot:     {info.summary}\n")
+                    if info.magisk_patched:
+                        self.output.insert(
+                            "end",
+                            "warning:  image looks Magisk-patched — flashing this "
+                            "WILL keep root, but verify it matches your device.\n")
+                    elif info.other_root:
+                        self.output.insert(
+                            "end",
+                            f"warning:  image contains {', '.join(info.other_root)} "
+                            "markers — incompatible with Magisk on-device.\n")
         elif kind == "_flash_hash_err":
             self.output.insert("end", f"\nhash error: {ev['error']}\n")
 
@@ -2555,6 +3066,11 @@ class RestoreView(ctk.CTkFrame):
         if not ok:
             return
 
+        # Restoring multiple partitions takes minutes — battery check is
+        # especially important here.
+        if not self.app.confirm_battery_ok("restore"):
+            return
+
         serial = self.app.current_device.serial if self.app.current_device else None
         include_userdata = self.include_userdata.get()
         force = self.force.get()
@@ -2586,6 +3102,8 @@ class RestoreView(ctk.CTkFrame):
             self.output.insert("end", "Restore complete.\n")
             self.app.toast("Restore complete.", "ok")
             self.app.status("Restore complete.", "ok")
+            notify("ROM Extractor — Restore",
+                   "Restore complete.", sound=True)
         elif kind == "_restore_finished":
             self.restore_btn.configure(state="normal", text="Restore backup")
 
@@ -2946,6 +3464,9 @@ class VerifyView(ctk.CTkFrame):
             self.app.toast("Verification OK." if ok else "Verification FAILED.",
                            "ok" if ok else "err")
             self.app.status(msg, "ok" if ok else "err")
+            notify("ROM Extractor — Verify",
+                   "Verification OK." if ok else "Verification FAILED.",
+                   sound=not ok)
         elif kind == "_verify_finished":
             self.verify_btn.configure(state="normal", text="Verify all")
 
@@ -3048,6 +3569,9 @@ class SideloadView(ctk.CTkFrame):
             self.app.toast("ZIP does not exist.", "err")
             return
 
+        if not self.app.confirm_battery_ok("sideload"):
+            return
+
         serial = self.app.current_device.serial if self.app.current_device else None
         self.output.delete("1.0", "end")
         self.output.insert("end",
@@ -3083,6 +3607,8 @@ class SideloadView(ctk.CTkFrame):
             self.output.insert("end", "Sideload complete.\n")
             self.app.toast("Sideload complete.", "ok")
             self.app.status("Sideload complete.", "ok")
+            notify("ROM Extractor — Sideload",
+                   "Sideload complete.", sound=True)
         elif kind == "_sideload_finished":
             self.sl_btn.configure(state="normal", text="Sideload")
         elif kind == "_sideload_hash":
@@ -3165,6 +3691,7 @@ class AppsView(ctk.CTkFrame):
                 ("Reload", self._reload),
                 ("All",    lambda: self._set_all(True)),
                 ("None",   lambda: self._set_all(False)),
+                ("Export", self._export_list),
         )):
             ctk.CTkButton(
                 tool, text=label, command=cmd, height=26, width=68,
@@ -3342,6 +3869,64 @@ class AppsView(ctk.CTkFrame):
         for r in self._rows.values():
             r["var"].set(val)
         self._update_action_label()
+
+    def _export_list(self) -> None:
+        """Save the currently-loaded package list as JSON or CSV.
+
+        Respects the search filter — exports only what's visible. JSON or CSV
+        is chosen by file extension. Honest about what we have: each row is
+        (package, paths, is_system). No app *name* — pm list doesn't give us
+        the human-readable label without a `dumpsys package` call per app."""
+        if not self._packages:
+            self.app.toast("Reload first — no packages to export.", "warn")
+            return
+        # Apply search filter so the export matches what the user sees.
+        needle = self.search_entry.get().strip().lower()
+        rows = [p for p in self._packages
+                if not needle or needle in p.package.lower()]
+        if not rows:
+            self.app.toast("Filter excludes everything — nothing to export.", "warn")
+            return
+
+        default = f"apps-{int(time.time())}.json"
+        path = filedialog.asksaveasfilename(
+            title="Export package list",
+            defaultextension=".json",
+            initialfile=default,
+            filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            p = Path(path)
+            if p.suffix.lower() == ".csv":
+                import csv
+                with p.open("w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["package", "paths", "is_system"])
+                    for pkg in rows:
+                        w.writerow([pkg.package, ";".join(pkg.paths),
+                                    "yes" if pkg.is_system else "no"])
+            else:
+                payload = {
+                    "device": (
+                        {"serial": self.app.current_device.serial,
+                         "model":  self.app.current_device.model,
+                         "fingerprint": self.app.current_device.fingerprint}
+                        if self.app.current_device else None
+                    ),
+                    "exported_at": _isoformat_now(),
+                    "count": len(rows),
+                    "packages": [
+                        {"package": pkg.package, "paths": pkg.paths,
+                         "is_system": pkg.is_system}
+                        for pkg in rows
+                    ],
+                }
+                p.write_text(json.dumps(payload, indent=2))
+            self.app.toast(f"Saved {len(rows)} packages to {p.name}.", "ok")
+        except Exception as e:
+            self.app.toast(f"Export failed: {e}", "err")
 
     def _update_action_label(self):
         sel = [n for n, r in self._rows.items() if r["var"].get()]
@@ -3715,6 +4300,7 @@ class PropertiesView(ctk.CTkFrame):
             self, icon="ⓘ", title="Properties",
             subtitle="All Android system properties from the connected device.",
             actions=[("Copy JSON", self._copy_json),
+                     ("Export…",  self._export),
                      ("Refresh",   self._refresh)],
         ).grid(row=0, column=0, sticky="ew", pady=(0, 18))
 
@@ -3764,6 +4350,39 @@ class PropertiesView(ctk.CTkFrame):
         self.app.clipboard_clear()
         self.app.clipboard_append(json.dumps(d.properties, indent=2, sort_keys=True))
         self.app.toast("Properties JSON copied.", "ok")
+
+    def _export(self):
+        """Save the property dump as JSON or as raw `getprop` text."""
+        d = self.app.current_device
+        if not d or not d.properties:
+            self.app.toast("No properties loaded — connect and refresh.", "warn")
+            return
+        default = f"props-{d.serial}-{int(time.time())}.json"
+        path = filedialog.asksaveasfilename(
+            title="Export properties",
+            defaultextension=".json",
+            initialfile=default,
+            filetypes=[("JSON", "*.json"), ("Text (getprop)", "*.txt"),
+                       ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            p = Path(path)
+            if p.suffix.lower() == ".txt":
+                lines = [f"[{k}]: [{v}]" for k, v in sorted(d.properties.items())]
+                p.write_text("\n".join(lines) + "\n")
+            else:
+                payload = {
+                    "device": {"serial": d.serial, "model": d.model,
+                               "fingerprint": d.fingerprint},
+                    "exported_at": _isoformat_now(),
+                    "properties": dict(sorted(d.properties.items())),
+                }
+                p.write_text(json.dumps(payload, indent=2))
+            self.app.toast(f"Saved {len(d.properties)} props to {p.name}.", "ok")
+        except Exception as e:
+            self.app.toast(f"Export failed: {e}", "err")
 
     def on_device_changed(self) -> None:
         self._render()

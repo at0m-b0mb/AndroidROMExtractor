@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import platform
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +50,39 @@ def confirm(prompt: str, assume_yes: bool = False) -> bool:
         return True
     answer = console.input(f"[yellow]{prompt}[/yellow] [y/N]: ").strip().lower()
     return answer in ("y", "yes")
+
+
+_log = logging.getLogger(__name__)
+
+
+def notify(title: str, message: str, sound: bool = False) -> None:
+    """Best-effort native notification. macOS uses osascript; Linux uses
+    notify-send if available. Never raises — notifications are nice-to-have.
+
+    Note: macOS Notification Center sometimes silently drops messages from
+    osascript if the user has 'Script Editor' notifications disabled. There's
+    no reliable way around this without code-signing a helper app."""
+    sys_name = platform.system()
+    try:
+        if sys_name == "Darwin":
+            # Escape double quotes for AppleScript.
+            t = title.replace('"', '\\"')
+            m = message.replace('"', '\\"')
+            script = f'display notification "{m}" with title "{t}"'
+            if sound:
+                script += ' sound name "Glass"'
+            subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=4,
+            )
+        elif sys_name == "Linux" and shutil.which("notify-send"):
+            args = ["notify-send", title, message]
+            if sound:
+                args.insert(1, "--urgency=normal")
+            subprocess.run(args, capture_output=True, timeout=4)
+    except Exception as e:
+        # Don't let notification failures break the calling code.
+        _log.debug("notify() failed: %s", e)
 
 
 class CommandError(RuntimeError):

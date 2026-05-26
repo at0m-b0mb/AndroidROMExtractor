@@ -1,7 +1,10 @@
 """Flashing logic: fastboot flash, fastboot boot, adb sideload, manifest restore."""
 from __future__ import annotations
 
+import gzip
 import logging
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -117,7 +120,9 @@ def restore_backup(
     include_set = set(include) if include else None
     exclude_set = set(exclude or [])
 
-    queue: list[tuple[str, Path]] = []
+    # Queue entries carry (name, on_disk_path, is_compressed) so that the
+    # flash loop knows whether to decompress to a temp file first.
+    queue: list[tuple[str, Path, bool]] = []
     for entry in manifest.partitions:
         name = entry["name"]
         if include_set is not None and name not in include_set:
@@ -136,37 +141,57 @@ def restore_backup(
             console.print(f"[red]Missing image {img}, skipping {name}[/red]")
             continue
 
-        # Pre-flash hash check.
-        actual = sha256_file(img)
+        compressed = entry.get("compression") == "gzip"
+
+        # Pre-flash hash check — for compressed entries, stream-decompress
+        # and hash the uncompressed content (matches manifest sha256).
+        if compressed:
+            from .verify import _sha256_uncompressed
+            actual, _ = _sha256_uncompressed(img)
+        else:
+            actual = sha256_file(img)
         if actual != entry["sha256"]:
             console.print(
                 f"[red]REFUSING to flash {name}: hash mismatch with manifest[/red]"
             )
             continue
 
-        queue.append((name, img))
+        queue.append((name, img, compressed))
 
     if not queue:
         console.print("[yellow]Nothing to restore.[/yellow]")
         return
 
     console.print("[bold]Will flash:[/bold]")
-    for name, img in queue:
-        console.print(f"  {name:<14} <- {img.name}")
+    for name, img, compressed in queue:
+        tag = "  [dim](gz)[/dim]" if compressed else ""
+        console.print(f"  {name:<14} <- {img.name}{tag}")
 
     if not confirm("Restore these partitions?", assume_yes=assume_yes):
         console.print("[yellow]Aborted.[/yellow]")
         return
 
     if dry_run:
-        for name, img in queue:
+        for name, img, _c in queue:
             console.print(f"[dim]DRY[/dim] fastboot flash {name} {img}")
         return
 
     fb_serial = _ensure_fastboot(serial)
-    for name, img in queue:
-        console.print(f"[bold blue]>>[/bold blue] flashing {name}")
-        try:
-            fastboot.flash(name, img, serial=fb_serial)
-        except CommandError as e:
-            console.print(f"[red]flash {name} failed:[/red] {e}")
+    # Decompress in a single tempdir so all cleanup is one rmtree.
+    with tempfile.TemporaryDirectory(prefix="arom-restore-") as tmp:
+        tmp_dir = Path(tmp)
+        for name, img, compressed in queue:
+            if compressed:
+                # Decompress to tmp first; fastboot can't take stdin for flash.
+                flash_src = tmp_dir / (name + ".img")
+                console.print(
+                    f"[dim]decompressing {img.name} -> {flash_src.name}[/dim]")
+                with gzip.open(img, "rb") as src, flash_src.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1 << 20)
+            else:
+                flash_src = img
+            console.print(f"[bold blue]>>[/bold blue] flashing {name}")
+            try:
+                fastboot.flash(name, flash_src, serial=fb_serial)
+            except CommandError as e:
+                console.print(f"[red]flash {name} failed:[/red] {e}")

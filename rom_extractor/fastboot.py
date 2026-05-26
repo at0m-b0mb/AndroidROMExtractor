@@ -82,3 +82,44 @@ def reboot(target: Optional[str] = None, serial: Optional[str] = None) -> None:
     if target:
         args.append(target)
     run(args, serial=serial, capture=False)
+
+
+def erase(partition: str, serial: Optional[str] = None) -> str:
+    """`fastboot erase <partition>` — wipes the partition. Often used on
+    cache, userdata, or metadata. Refuses on logically-mounted partitions
+    on Android 10+ devices using dynamic partitions."""
+    proc = run(["erase", partition], serial=serial, check=False, timeout=60)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        raise CommandError(["erase", partition], proc.returncode, out)
+    return out
+
+
+def flashing(action: str, serial: Optional[str] = None) -> str:
+    """`fastboot flashing {unlock|lock|unlock_critical|lock_critical|get_unlock_ability}`.
+
+    Modern command set (Android 5+). Older devices use `fastboot oem unlock`
+    instead — see :func:`oem`. Unlocking factory-resets the device on most
+    devices; the user must confirm on the phone screen.
+    """
+    valid = {"unlock", "lock", "unlock_critical", "lock_critical",
+             "get_unlock_ability"}
+    if action not in valid:
+        raise ValueError(f"Invalid flashing action: {action!r}. "
+                         f"Expected one of {sorted(valid)}.")
+    proc = run(["flashing", action], serial=serial, check=False, timeout=120)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        raise CommandError(["flashing", action], proc.returncode, out)
+    return out
+
+
+def oem(*args: str, serial: Optional[str] = None) -> str:
+    """Generic `fastboot oem <args...>` for OEM-specific commands like
+    `fastboot oem unlock`, `fastboot oem device-info`, etc. OEM commands
+    sometimes prompt on-device, so the timeout is generous."""
+    proc = run(["oem", *args], serial=serial, check=False, timeout=120)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        raise CommandError(["oem", *args], proc.returncode, out)
+    return out

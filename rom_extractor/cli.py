@@ -144,10 +144,14 @@ def list_partitions_cmd(serial: Optional[str]) -> None:
 @click.option("--serial", "-s", help="Device serial.")
 @click.option("--no-on-device-verify", is_flag=True,
               help="Skip the on-device sha256 cross-check (faster).")
+@click.option("--gzip", "gzip_compress", is_flag=True,
+              help="Compress each image on the host with gzip "
+                   "(roughly halves disk usage; hashes still match on-device).")
 @click.option("--dry-run", is_flag=True,
               help="Print what would happen without doing it.")
 def backup(out_dir: Path, parts_arg: Optional[str], all_parts: bool,
-           serial: Optional[str], no_on_device_verify: bool, dry_run: bool) -> None:
+           serial: Optional[str], no_on_device_verify: bool,
+           gzip_compress: bool, dry_run: bool) -> None:
     dev = _pick_device(serial)
     if dev.state != "device":
         console.print(f"[red]Device must be in adb mode, currently {dev.state}.[/red]")
@@ -196,6 +200,7 @@ def backup(out_dir: Path, parts_arg: Optional[str], all_parts: bool,
         out_dir=out_dir,
         verify_on_device=not no_on_device_verify,
         dry_run=dry_run,
+        compress=gzip_compress,
     )
 
     if dry_run:

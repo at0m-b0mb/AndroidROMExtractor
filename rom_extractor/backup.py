@@ -1,6 +1,7 @@
 """Streamed backup of partitions from a rooted Android device over ADB."""
 from __future__ import annotations
 
+import gzip
 import hashlib
 import logging
 import shlex
@@ -41,12 +42,22 @@ CHUNK = 1 << 20  # 1 MiB read chunks from adb stdout pipe
 
 def _stream_dd(serial: Optional[str], partition: Partition, out_file: Path,
                on_chunk: Callable[[int], None],
-               cancel: Optional[threading.Event] = None) -> tuple[int, str]:
+               cancel: Optional[threading.Event] = None,
+               compress: bool = False) -> tuple[int, int, str]:
     """
-    Pipe `su -c dd if=<block> bs=1M` over `adb exec-out`, write to out_file, hash as we go.
-    Calls on_chunk(n_bytes) after each chunk so the caller can drive its own progress UI.
-    If `cancel` is set mid-stream, kills the subprocess and raises BackupCancelled.
-    Returns (bytes_written, sha256_hex).
+    Pipe `su -c dd if=<block> bs=1M` over `adb exec-out`, write to out_file,
+    hash as we go.  Calls on_chunk(n_bytes) per uncompressed chunk so the
+    caller can drive a progress UI.
+
+    When `compress` is True the on-disk file is gzip-compressed but the hash
+    is computed on the *uncompressed* bytes so it still matches what
+    `sha256sum /dev/block/...` reports on-device.
+
+    If `cancel` is set mid-stream, kills the subprocess and raises
+    BackupCancelled.
+
+    Returns (uncompressed_bytes, on_disk_bytes, sha256_hex). When not
+    compressed, both byte counts are equal.
     """
     # `adb exec-out` is critical here — it bypasses the PTY line-mode mangling
     # that `adb shell` does, so binary data passes through cleanly.
@@ -60,14 +71,19 @@ def _stream_dd(serial: Optional[str], partition: Partition, out_file: Path,
     log.debug("$ %s", " ".join(args))
 
     h = hashlib.sha256()
-    written = 0
+    uncompressed = 0
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout is not None
     cancelled = False
     try:
-        with out_file.open("wb") as f:
+        raw = out_file.open("wb")
+        # GzipFile takes a file object and adds the gzip layer transparently;
+        # we still get the on-disk size from raw.tell() at the end.
+        sink = gzip.GzipFile(fileobj=raw, mode="wb",
+                             compresslevel=6) if compress else raw
+        try:
             while True:
                 if cancel is not None and cancel.is_set():
                     cancelled = True
@@ -75,10 +91,16 @@ def _stream_dd(serial: Optional[str], partition: Partition, out_file: Path,
                 buf = proc.stdout.read(CHUNK)
                 if not buf:
                     break
-                f.write(buf)
+                sink.write(buf)
                 h.update(buf)
-                written += len(buf)
+                uncompressed += len(buf)
                 on_chunk(len(buf))
+        finally:
+            if compress:
+                sink.close()  # flush gzip footer
+            on_disk = raw.tell()
+            raw.close()
+
         if cancelled:
             proc.kill()
             raise BackupCancelled(f"cancelled while backing up {partition.name}")
@@ -91,7 +113,7 @@ def _stream_dd(serial: Optional[str], partition: Partition, out_file: Path,
         stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
         raise CommandError(args, ret, stderr)
 
-    return written, h.hexdigest()
+    return uncompressed, on_disk, h.hexdigest()
 
 
 def _on_device_sha256(serial: Optional[str], block_path: str) -> Optional[str]:
@@ -108,6 +130,10 @@ def _on_device_sha256(serial: Optional[str], block_path: str) -> Optional[str]:
     return None
 
 
+def _entry_filename(p: Partition, compress: bool) -> str:
+    return p.filename() + ".gz" if compress else p.filename()
+
+
 def backup_partitions(
     device: Device,
     parts: Iterable[Partition],
@@ -116,6 +142,7 @@ def backup_partitions(
     dry_run: bool = False,
     events: Optional[EventCallback] = None,
     cancel: Optional[threading.Event] = None,
+    compress: bool = False,
 ) -> list[dict]:
     """
     Back up partitions to out_dir.
@@ -124,8 +151,14 @@ def backup_partitions(
     event and Rich progress is suppressed (the GUI uses this).
     If `events` is None, prints a Rich progress bar to the terminal.
 
+    With `compress=True`, every image is written through gzip on the host (the
+    on-device dd is unchanged). Disk usage drops ~50% for most partitions and
+    the on-device sha256 still cross-checks correctly because the hash is
+    computed on uncompressed bytes.
+
     Returns list of manifest entries:
-        { name, block_path, size_bytes, file, sha256, sha256_on_device, ... }
+        { name, block_path, size_bytes, file, sha256, sha256_on_device,
+          compression?: "gzip", compressed_size_bytes?: int, ... }
     """
     parts = list(parts)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,21 +166,24 @@ def backup_partitions(
 
     if dry_run:
         for p in parts:
+            tag = ".gz" if compress else ""
             console.print(
                 f"[dim]DRY[/dim] adb exec-out 'su -c dd if={p.block_path} bs=1M' "
-                f"> {out_dir / p.filename()}"
+                f"{'| gzip ' if compress else ''}> {out_dir / (p.filename() + tag)}"
             )
         return entries
 
     if events is not None:
         return _backup_with_callback(device, parts, out_dir, verify_on_device,
-                                     events, cancel)
+                                     events, cancel, compress)
 
-    return _backup_with_rich(device, parts, out_dir, verify_on_device, cancel)
+    return _backup_with_rich(device, parts, out_dir, verify_on_device,
+                             cancel, compress)
 
 
 def _backup_with_rich(device, parts, out_dir, verify_on_device,
-                      cancel: Optional[threading.Event] = None) -> list[dict]:
+                      cancel: Optional[threading.Event] = None,
+                      compress: bool = False) -> list[dict]:
     entries: list[dict] = []
     with Progress(
         TextColumn("[bold blue]{task.description}"),
@@ -160,16 +196,16 @@ def _backup_with_rich(device, parts, out_dir, verify_on_device,
         for p in parts:
             if cancel is not None and cancel.is_set():
                 break
-            target = out_dir / p.filename()
+            target = out_dir / _entry_filename(p, compress)
             total = p.size_bytes if p.size_bytes else 0
             task = progress.add_task(p.name, total=total or None)
 
             started = datetime.now(timezone.utc)
             try:
-                written, host_sha = _stream_dd(
+                uncompressed, on_disk, host_sha = _stream_dd(
                     device.serial, p, target,
                     on_chunk=lambda n: progress.update(task, advance=n),
-                    cancel=cancel,
+                    cancel=cancel, compress=compress,
                 )
             except BackupCancelled:
                 progress.update(task, description=f"[yellow]{p.name} cancelled")
@@ -188,21 +224,27 @@ def _backup_with_rich(device, parts, out_dir, verify_on_device,
                         p.name, host_sha[:12], on_device_sha[:12],
                     )
 
-            entries.append({
+            entry = {
                 "name": p.name,
                 "block_path": p.block_path,
-                "size_bytes": written,
-                "file": p.filename(),
+                "size_bytes": uncompressed,
+                "file": _entry_filename(p, compress),
                 "sha256": host_sha,
                 "sha256_on_device": on_device_sha,
                 "started_at": started.isoformat(),
                 "finished_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            if compress:
+                entry["compression"] = "gzip"
+                entry["compressed_size_bytes"] = on_disk
+            entries.append(entry)
 
+            label = (f"{human_size(uncompressed)} -> {human_size(on_disk)}"
+                     if compress else human_size(uncompressed))
             progress.update(
                 task,
-                description=f"[green]{p.name}[/green] {human_size(written)}",
-                completed=written, total=written,
+                description=f"[green]{p.name}[/green] {label}",
+                completed=uncompressed, total=uncompressed,
             )
 
     return entries
@@ -210,21 +252,22 @@ def _backup_with_rich(device, parts, out_dir, verify_on_device,
 
 def _backup_with_callback(device, parts, out_dir, verify_on_device,
                           events: EventCallback,
-                          cancel: Optional[threading.Event] = None) -> list[dict]:
+                          cancel: Optional[threading.Event] = None,
+                          compress: bool = False) -> list[dict]:
     entries: list[dict] = []
     for p in parts:
         if cancel is not None and cancel.is_set():
             events({"type": "cancelled", "name": p.name})
             break
-        target = out_dir / p.filename()
+        target = out_dir / _entry_filename(p, compress)
         events({"type": "start", "name": p.name, "total": p.size_bytes})
         started = datetime.now(timezone.utc)
         try:
-            written, host_sha = _stream_dd(
+            uncompressed, on_disk, host_sha = _stream_dd(
                 device.serial, p, target,
                 on_chunk=lambda n, _name=p.name: events(
                     {"type": "advance", "name": _name, "bytes": n}),
-                cancel=cancel,
+                cancel=cancel, compress=compress,
             )
         except BackupCancelled:
             events({"type": "cancelled", "name": p.name})
@@ -244,14 +287,18 @@ def _backup_with_callback(device, parts, out_dir, verify_on_device,
         entry = {
             "name": p.name,
             "block_path": p.block_path,
-            "size_bytes": written,
-            "file": p.filename(),
+            "size_bytes": uncompressed,
+            "file": _entry_filename(p, compress),
             "sha256": host_sha,
             "sha256_on_device": on_device_sha,
             "started_at": started.isoformat(),
             "finished_at": datetime.now(timezone.utc).isoformat(),
         }
+        if compress:
+            entry["compression"] = "gzip"
+            entry["compressed_size_bytes"] = on_disk
         entries.append(entry)
-        events({"type": "done", "name": p.name, "written": written,
+        events({"type": "done", "name": p.name, "written": uncompressed,
+                "compressed_size": on_disk if compress else None,
                 "sha256": host_sha, "sha256_on_device": on_device_sha})
     return entries

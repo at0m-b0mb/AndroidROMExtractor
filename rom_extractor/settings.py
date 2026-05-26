@@ -22,6 +22,7 @@ class Settings:
     last_output_dir: str = ""
     last_backup_dir: str = ""
     auto_verify_after_backup: bool = True
+    compress_backups: bool = False
     default_partition_selection: list[str] = field(default_factory=list)
     recent_backups: list[str] = field(default_factory=list)
     partition_presets: dict[str, list[str]] = field(default_factory=dict)
