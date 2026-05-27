@@ -314,7 +314,7 @@ class Tag(ctk.CTkLabel):
         super().__init__(
             master, text=f" {text} ", font=F(size=9, weight="bold"),
             text_color=color, fg_color=BG, corner_radius=4,
-            padx=4,
+            padx=3, pady=0, height=18,
         )
 
 
@@ -1402,7 +1402,10 @@ class App(ctk.CTk):
         # (serial, state, rooted) per device.
         self._last_device_signature: Optional[tuple] = None
         self._auto_poll_after_id: Optional[str] = None
-        self.AUTO_POLL_INTERVAL_MS = 3500
+        # Faster polling so a freshly-plugged-in phone shows up (and its
+        # partitions are enumerated) within ~1 s of being connected, without
+        # the user having to click Refresh.
+        self.AUTO_POLL_INTERVAL_MS = 1200
 
         self._build_layout()
         self._bind_shortcuts()
@@ -2108,7 +2111,16 @@ class BackupView(ctk.CTkFrame):
         self.parts_count = ctk.CTkLabel(
             head, text="", font=F(size=11), text_color=TEXT_MUTED, anchor="e",
         )
-        self.parts_count.grid(row=0, column=1, sticky="e")
+        self.parts_count.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        # Inline refresh — same as the sidebar Refresh, but discoverable
+        # right next to the partition list.
+        ctk.CTkButton(
+            head, text="↻", command=self.app.refresh_devices,
+            height=22, width=26,
+            fg_color=SURFACE_2, hover_color=SURFACE_3, text_color=TEXT_DIM,
+            border_width=1, border_color=BORDER_2,
+            font=F(size=12, weight="bold"), corner_radius=6,
+        ).grid(row=0, column=2, sticky="e")
 
         tool = ctk.CTkFrame(parts_card, fg_color="transparent")
         tool.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
@@ -2410,53 +2422,80 @@ class BackupView(ctk.CTkFrame):
 
         for i, p in enumerate(self.app.partitions):
             row = self._make_partition_row(p, in_default=p.name in default)
-            row.grid(row=i, column=0, sticky="ew", padx=4, pady=1)
+            row.grid(row=i, column=0, sticky="ew", padx=2, pady=0)
             self.partition_rows[p.name] = row
         self._update_selection_label()
         self._apply_filter()
 
+    PART_ROW_HEIGHT = 24
+
     def _make_partition_row(self, p: Partition, in_default: bool) -> ctk.CTkFrame:
+        # Fixed-height row so 90+ partitions fit comfortably in the scrollable
+        # card. grid_propagate(False) keeps the row from being stretched by its
+        # children — without it, CTkCheckBox's default ~24px box plus pady
+        # would balloon each row.
         row = ctk.CTkFrame(self.parts_scroll, fg_color="transparent",
-                           corner_radius=6, height=30)
+                           corner_radius=4, height=self.PART_ROW_HEIGHT)
+        row.grid_propagate(False)
         row.grid_columnconfigure(1, weight=1)
+        row.grid_rowconfigure(0, weight=1)
 
         var = tk.BooleanVar(value=in_default and not is_dangerous(p.name))
         self.partition_vars[p.name] = var
 
         cb = ctk.CTkCheckBox(
-            row, text="", variable=var, width=20,
+            row, text="", variable=var, width=18, height=18,
+            checkbox_width=14, checkbox_height=14, corner_radius=3,
+            border_width=2,
             fg_color=ACCENT, hover_color=ACCENT_HOV, border_color=BORDER_2,
             command=self._update_selection_label,
         )
-        cb.grid(row=0, column=0, padx=(10, 8), pady=5)
+        cb.grid(row=0, column=0, padx=(10, 8), pady=0, sticky="w")
 
-        ctk.CTkLabel(
+        name_lbl = ctk.CTkLabel(
             row, text=p.name, anchor="w", font=F(size=12), text_color=TEXT,
-        ).grid(row=0, column=1, sticky="w")
+            height=self.PART_ROW_HEIGHT,
+        )
+        name_lbl.grid(row=0, column=1, sticky="w", pady=0)
 
-        ctk.CTkLabel(
+        size_lbl = ctk.CTkLabel(
             row, text=human_size(p.size_bytes) if p.size_bytes else "?",
-            anchor="e", font=F_MONO(size=11), text_color=TEXT_MUTED, width=80,
-        ).grid(row=0, column=2, sticky="e", padx=(0, 6))
+            anchor="e", font=F_MONO(size=11), text_color=TEXT_MUTED,
+            width=70, height=self.PART_ROW_HEIGHT,
+        )
+        size_lbl.grid(row=0, column=2, sticky="e", padx=(0, 8), pady=0)
 
-        tags = ctk.CTkFrame(row, fg_color="transparent")
-        tags.grid(row=0, column=3, sticky="e", padx=(0, 10))
+        tags = ctk.CTkFrame(row, fg_color="transparent",
+                            height=self.PART_ROW_HEIGHT)
+        tags.grid(row=0, column=3, sticky="e", padx=(0, 10), pady=0)
+        tags.grid_propagate(False)
         if is_dangerous(p.name):
-            Tag(tags, "DANGER", DANGER).pack(side="left", padx=2)
+            Tag(tags, "DANGER", DANGER).pack(side="left", padx=1)
         if p.name in MTK_CRITICAL:
-            Tag(tags, "MTK",    MTK).pack(side="left", padx=2)
+            Tag(tags, "MTK",    MTK).pack(side="left", padx=1)
         if p.name in ("userdata", "data"):
-            Tag(tags, "LARGE",  WARN).pack(side="left", padx=2)
+            Tag(tags, "LARGE",  WARN).pack(side="left", padx=1)
 
-        # Hover effect.
+        # Hover effect — bind across all child widgets so moving the cursor
+        # over the label/size text still highlights the row instead of
+        # flickering the background off.
         def on_enter(_e):
             if not self._running:
                 row.configure(fg_color=SURFACE_2)
         def on_leave(_e):
             row.configure(fg_color="transparent")
-        for w in (row,):
+        for w in (row, name_lbl, size_lbl, tags):
             w.bind("<Enter>", on_enter)
             w.bind("<Leave>", on_leave)
+        # Clicking anywhere on the row toggles the checkbox — much friendlier
+        # than only the tiny checkbox indicator being clickable.
+        def on_click(_e):
+            if self._running:
+                return
+            var.set(not var.get())
+            self._update_selection_label()
+        for w in (name_lbl, size_lbl):
+            w.bind("<Button-1>", on_click)
 
         return row
 
